@@ -25,9 +25,15 @@ cleaned_img = (cleaned * 255).astype(np.uint8)
 
 # Inverte a imagem para deixar o texto em preto
 final = cv2.bitwise_not(cleaned_img)
+scale_percent = 200  # 200% do tamanho original
 
+# Calcula o novo tamanho
+width = int(final.shape[1] * scale_percent / 100)
+height = int(final.shape[0] * scale_percent / 100)
+dim = (width, height)
+resized_final = cv2.resize(final, dim, interpolation=cv2.INTER_LINEAR)
 # Salva a imagem final
-cv2.imwrite(cleaned_img_name, final)
+cv2.imwrite(cleaned_img_name, resized_final)
 
 
 
@@ -39,8 +45,9 @@ print(f"Usando dispositivo: {device}")
 image = Image.open(cleaned_img_name).convert("RGB")
 
 # Carrega processor e modelo e move para GPU
-processor = TrOCRProcessor.from_pretrained('microsoft/trocr-large-printed')
-model = VisionEncoderDecoderModel.from_pretrained('microsoft/trocr-large-printed').to(device)
+processor = TrOCRProcessor.from_pretrained('microsoft/trocr-large-printed', use_fast=True)
+model = VisionEncoderDecoderModel.from_pretrained('microsoft/trocr-large-printed',
+                                                  ignore_mismatched_sizes=True).to(device)
 
 # Processa imagem
 pixel_values = processor(images=image, return_tensors="pt").pixel_values.to(device)

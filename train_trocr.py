@@ -79,9 +79,9 @@ def collate_fn(batch):
 if __name__ == "__main__":
     captcha_dir = "captchas"
     output_dir = "trocr_captcha_model"
-    epochs = 5
-    batch_size = 2
-    learning_rate = 5e-5
+    epochs = 10
+    batch_size = 16
+    learning_rate = 2e-5
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if torch.cuda.is_available():
@@ -90,8 +90,8 @@ if __name__ == "__main__":
 
     os.makedirs(output_dir, exist_ok=True)
 
-    processor = TrOCRProcessor.from_pretrained("microsoft/trocr-large-printed")  # Pode usar "large" se tiver recursos
-    model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-large-printed").to(device)
+    processor = TrOCRProcessor.from_pretrained("microsoft/trocr-small-printed")  # Pode usar "large" se tiver recursos
+    model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-small-printed").to(device)
     # Adiciona isso para evitar o erro
     model.config.pad_token_id = processor.tokenizer.pad_token_id
     model.config.decoder_start_token_id = processor.tokenizer.cls_token_id or processor.tokenizer.bos_token_id
@@ -107,7 +107,7 @@ if __name__ == "__main__":
         output_dir=output_dir,
         do_train=True,
         do_eval=True,
-        eval_steps=500,
+        eval_steps=1000,
         per_device_train_batch_size=batch_size,
         per_device_eval_batch_size=batch_size,
         gradient_accumulation_steps=4,

@@ -7,7 +7,7 @@ MODEL_DIR = "trocr_captcha_model/final_model"
 PROCESSOR_DIR = "trocr_captcha_model/final_processor"
 
 # Caminho da imagem para inferência
-IMAGE_PATH = "caminho/para/sua_imagem.png"
+IMAGE_PATH = "cleaned_image.png"
 
 def predict(image_path):
     # Seleciona o dispositivo (GPU ou CPU)

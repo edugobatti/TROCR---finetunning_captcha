@@ -1,0 +1,9 @@
+!*.py
+*/
+!.gitignore
+*.png
+*.jpeg
+./captchas
+captchas/
+*.zip
+*.7z
