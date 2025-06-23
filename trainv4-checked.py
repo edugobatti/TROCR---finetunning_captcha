@@ -12,6 +12,7 @@ import logging
 import random
 import time
 from tqdm import tqdm
+import json
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -108,6 +109,58 @@ class AntiOverfittingDataset(Dataset):
         }
 
 # ============================================
+# FUNÇÕES DE CHECKPOINT
+# ============================================
+def save_checkpoint(model, optimizer, epoch, best_accuracy, train_losses, val_losses, 
+                   patience_counter, checkpoint_path):
+    """Salva checkpoint completo do treinamento"""
+    checkpoint = {
+        'epoch': epoch,
+        'best_accuracy': best_accuracy,
+        'train_losses': train_losses,
+        'val_losses': val_losses,
+        'patience_counter': patience_counter,
+        'optimizer_state_dict': optimizer.state_dict(),
+        'random_state': random.getstate(),
+        'numpy_random_state': np.random.get_state(),
+        'torch_random_state': torch.get_rng_state(),
+    }
+    
+    # Se CUDA disponível, salvar estado CUDA também
+    if torch.cuda.is_available():
+        checkpoint['cuda_random_state'] = torch.cuda.get_rng_state()
+    
+    torch.save(checkpoint, checkpoint_path)
+    logger.info(f"✓ Checkpoint saved at epoch {epoch+1}")
+
+def load_checkpoint(checkpoint_path, model, optimizer, device):
+    """Carrega checkpoint e retorna estado do treinamento"""
+    if not os.path.exists(checkpoint_path):
+        return None
+    
+    logger.info(f"Loading checkpoint from {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    # Restaurar estados aleatórios
+    random.setstate(checkpoint['random_state'])
+    np.random.set_state(checkpoint['numpy_random_state'])
+    torch.set_rng_state(checkpoint['torch_random_state'])
+    
+    if torch.cuda.is_available() and 'cuda_random_state' in checkpoint:
+        torch.cuda.set_rng_state(checkpoint['cuda_random_state'])
+    
+    # Restaurar optimizer
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    
+    return {
+        'epoch': checkpoint['epoch'],
+        'best_accuracy': checkpoint['best_accuracy'],
+        'train_losses': checkpoint['train_losses'],
+        'val_losses': checkpoint['val_losses'],
+        'patience_counter': checkpoint['patience_counter']
+    }
+
+# ============================================
 # FUNÇÃO PRINCIPAL
 # ============================================
 def train_anti_overfitting():
@@ -115,6 +168,7 @@ def train_anti_overfitting():
     CAPTCHA_FOLDER = "captchas"
     MODEL_NAME = "microsoft/trocr-base-printed"
     OUTPUT_DIR = "./trocr-anti-overfit-final-overbaseV2"
+    CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "checkpoints")
     BATCH_SIZE = 16
     LEARNING_RATE = 1e-5
     WEIGHT_DECAY = 0.1
@@ -123,11 +177,16 @@ def train_anti_overfitting():
     LABEL_SMOOTHING = 0.1
     DROPOUT = 0.3
     AUGMENT_PROB = 0.8
+    SAVE_EVERY = 1  # Salvar checkpoint a cada N epochs
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
+    # Criar diretórios
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    
     logger.info("="*60)
-    logger.info("TREINAMENTO ANTI-OVERFITTING")
+    logger.info("TREINAMENTO ANTI-OVERFITTING COM CHECKPOINT")
     logger.info("="*60)
     logger.info(f"Device: {device}")
     logger.info(f"Model: {MODEL_NAME}")
@@ -136,6 +195,7 @@ def train_anti_overfitting():
     logger.info(f"Weight decay: {WEIGHT_DECAY}")
     logger.info(f"Dropout: {DROPOUT}")
     logger.info(f"Augmentation: {AUGMENT_PROB*100}%")
+    logger.info(f"Checkpoint dir: {CHECKPOINT_DIR}")
     
     # Carregar dados
     image_paths = []
@@ -159,10 +219,19 @@ def train_anti_overfitting():
     
     logger.info(f"Train: {len(train_paths)}, Val: {len(val_paths)}")
     
-    # Carregar modelo e processor
-    logger.info(f"\nLoading {MODEL_NAME}...")
-    processor = TrOCRProcessor.from_pretrained(MODEL_NAME)
-    model = VisionEncoderDecoderModel.from_pretrained(MODEL_NAME)
+    # Verificar se existe checkpoint
+    checkpoint_path = os.path.join(CHECKPOINT_DIR, "latest_checkpoint.pt")
+    model_checkpoint_path = os.path.join(CHECKPOINT_DIR, "model_checkpoint")
+    
+    if os.path.exists(model_checkpoint_path) and os.path.exists(checkpoint_path):
+        logger.info("\n✓ Found existing checkpoint! Loading...")
+        # Carregar modelo do checkpoint
+        processor = TrOCRProcessor.from_pretrained(model_checkpoint_path)
+        model = VisionEncoderDecoderModel.from_pretrained(model_checkpoint_path)
+    else:
+        logger.info(f"\nLoading {MODEL_NAME}...")
+        processor = TrOCRProcessor.from_pretrained(MODEL_NAME)
+        model = VisionEncoderDecoderModel.from_pretrained(MODEL_NAME)
     
     # IMPORTANTE: Configurar tokens especiais
     if processor.tokenizer.cls_token_id is None:
@@ -264,17 +333,31 @@ def train_anti_overfitting():
     
     criterion = LabelSmoothingCrossEntropy(LABEL_SMOOTHING)
     
-    # Training
-    best_accuracy = 0
-    patience_counter = 0
-    train_losses = []
-    val_losses = []
+    # Carregar checkpoint se existir
+    checkpoint_info = load_checkpoint(checkpoint_path, model, optimizer, device)
     
+    if checkpoint_info:
+        start_epoch = checkpoint_info['epoch'] + 1
+        best_accuracy = checkpoint_info['best_accuracy']
+        train_losses = checkpoint_info['train_losses']
+        val_losses = checkpoint_info['val_losses']
+        patience_counter = checkpoint_info['patience_counter']
+        logger.info(f"✓ Resuming from epoch {start_epoch}")
+        logger.info(f"✓ Best accuracy so far: {best_accuracy:.2%}")
+    else:
+        start_epoch = 0
+        best_accuracy = 0
+        patience_counter = 0
+        train_losses = []
+        val_losses = []
+        logger.info("✓ Starting fresh training")
+    
+    # Training
     logger.info("\n" + "="*60)
     logger.info("STARTING TRAINING")
     logger.info("="*60)
     
-    for epoch in range(NUM_EPOCHS):
+    for epoch in range(start_epoch, NUM_EPOCHS):
         epoch_start = time.time()
         
         # Train
@@ -406,7 +489,6 @@ def train_anti_overfitting():
             best_accuracy = accuracy
             patience_counter = 0
             
-            os.makedirs(OUTPUT_DIR, exist_ok=True)
             model.save_pretrained(OUTPUT_DIR)
             processor.save_pretrained(OUTPUT_DIR)
             
@@ -416,6 +498,19 @@ def train_anti_overfitting():
             if patience_counter >= PATIENCE:
                 logger.info(f"\nEarly stopping after {PATIENCE} epochs without improvement!")
                 break
+        
+        # Salvar checkpoint a cada SAVE_EVERY epochs
+        if (epoch + 1) % SAVE_EVERY == 0:
+            # Salvar modelo checkpoint
+            model.save_pretrained(model_checkpoint_path)
+            processor.save_pretrained(model_checkpoint_path)
+            
+            # Salvar estado do treinamento
+            save_checkpoint(
+                model, optimizer, epoch, best_accuracy, 
+                train_losses, val_losses, patience_counter, 
+                checkpoint_path
+            )
         
         # Examples every 5 epochs
         if (epoch + 1) % 5 == 0:
@@ -448,6 +543,11 @@ def train_anti_overfitting():
     logger.info(f"Best accuracy: {best_accuracy:.2%}")
     logger.info(f"Model saved at: {OUTPUT_DIR}")
     
+    # Limpar checkpoints após conclusão
+    if os.path.exists(checkpoint_path):
+        os.remove(checkpoint_path)
+        logger.info("✓ Checkpoint files cleaned up")
+    
     if len(train_losses) > 0 and len(val_losses) > 0:
         final_gap = val_losses[-1] - train_losses[-1]
         logger.info(f"\nOverfitting Analysis:")
@@ -467,6 +567,7 @@ if __name__ == "__main__":
         train_anti_overfitting()
     except KeyboardInterrupt:
         logger.info("\nTraining interrupted by user")
+        logger.info("✓ Progress saved - you can resume training by running the script again")
     except Exception as e:
         logger.error(f"Error: {e}")
         import traceback
