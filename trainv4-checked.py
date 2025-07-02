@@ -167,7 +167,7 @@ def train_anti_overfitting():
     # Configurações
     CAPTCHA_FOLDER = "captchas"
     MODEL_NAME = "microsoft/trocr-base-printed"
-    OUTPUT_DIR = "./trocr-anti-overfit-final-overbaseV2"
+    OUTPUT_DIR = "./trocr-anti-overfit-final-overbaseV2-check"
     CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "checkpoints")
     BATCH_SIZE = 16
     LEARNING_RATE = 1e-5

@@ -114,12 +114,12 @@ def train_anti_overfitting():
     # Configurações
     CAPTCHA_FOLDER = "captchas"
     MODEL_NAME = "microsoft/trocr-base-printed"
-    OUTPUT_DIR = "./trocr-anti-overfit-final-overbaseV2"
+    OUTPUT_DIR = "./trocr-anti-overfit-final-overbaseV5-max"
     BATCH_SIZE = 16
     LEARNING_RATE = 1e-5
     WEIGHT_DECAY = 0.1
-    NUM_EPOCHS = 50
-    PATIENCE = 10
+    NUM_EPOCHS = 30
+    PATIENCE = 7
     LABEL_SMOOTHING = 0.1
     DROPOUT = 0.3
     AUGMENT_PROB = 0.8

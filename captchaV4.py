@@ -64,4 +64,4 @@ def gerar_captchas_com_letras_pretas(qtd_imagens: int, pasta_destino: str = "cap
         caminho_arquivo = os.path.join(pasta_destino, f"{texto}.png")
         img.save(caminho_arquivo)
 
-gerar_captchas_com_letras_pretas(30000)
+gerar_captchas_com_letras_pretas(50000)
