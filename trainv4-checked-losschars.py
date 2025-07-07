@@ -250,28 +250,30 @@ def train_anti_overfitting():
     # Configurações
     CAPTCHA_FOLDER = "captchas"
     MODEL_NAME = "microsoft/trocr-base-printed"
-    OUTPUT_DIR = "./trocr-anti-overfit-final-overbaseV5-max"
+    OUTPUT_DIR = "./trocr-anti-overfit-final-overbaseV6-chars"
     BATCH_SIZE = 16
     LEARNING_RATE = 1e-5
     WEIGHT_DECAY = 0.1
     NUM_EPOCHS = 30
-    PATIENCE = 7
+    PATIENCE = 5
     LABEL_SMOOTHING = 0.1
     DROPOUT = 0.3
     AUGMENT_PROB = 0.8
+    SIMILARITY_WEIGHT = 2.5  # Peso para erros entre caracteres similares
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     logger.info("="*60)
-    logger.info("TREINAMENTO ANTI-OVERFITTING COM CHECKPOINTS")
+    logger.info("TREINAMENTO ANTI-OVERFITTING")
     logger.info("="*60)
     logger.info(f"Device: {device}")
-    logger.info(f"Model: {MODEL_NAME}")
+    logger.info(f"Modelo: {MODEL_NAME}")
     logger.info(f"Batch size: {BATCH_SIZE}")
     logger.info(f"Learning rate: {LEARNING_RATE}")
     logger.info(f"Weight decay: {WEIGHT_DECAY}")
     logger.info(f"Dropout: {DROPOUT}")
     logger.info(f"Augmentation: {AUGMENT_PROB*100}%")
+    logger.info(f"Similarity penalty weight: {SIMILARITY_WEIGHT}x")
     
     # Verificar se existe checkpoint
     checkpoint = load_latest_checkpoint(OUTPUT_DIR)
@@ -415,14 +417,79 @@ def train_anti_overfitting():
         except Exception as e:
             logger.warning(f"Could not restore optimizer state: {e}")
     
-    # Loss com label smoothing
-    class LabelSmoothingCrossEntropy(nn.Module):
-        def __init__(self, smoothing=0.1):
+    # Loss com label smoothing e ponderação por similaridade
+    class WeightedLabelSmoothingCrossEntropy(nn.Module):
+        def __init__(self, processor, smoothing=0.1, similarity_weight=2.0):
             super().__init__()
+            self.processor = processor
             self.smoothing = smoothing
             self.confidence = 1.0 - smoothing
+            self.similarity_weight = similarity_weight
+            
+            # Definir grupos de caracteres similares
+            self.similar_groups = [
+                # Números vs letras
+                ['0', 'O', 'o'],
+                ['1', 'I', 'l', '|'],
+                ['2', 'Z'],
+                ['5', 'S', 's'],
+                ['6', 'G', 'b'],
+                ['8', 'B'],
+                ['9', 'g', 'q'],
+                
+                # Letras similares
+                ['I', 'l', '1', '|'],
+                ['O', '0', 'o', 'Q'],
+                ['C', 'c', 'G'],
+                ['P', 'p', 'R'],
+                ['U', 'u', 'V', 'v'],
+                ['W', 'w', 'M'],
+                ['n', 'h', 'r'],
+                ['m', 'rn', 'nn'],
+                ['cl', 'd'],
+                ['ti', 'ii'],
+                ['vv', 'w'],
+                ['rn', 'm'],
+                
+                # Maiúsculas vs minúsculas
+                ['A', 'a'], ['B', 'b'], ['C', 'c'], ['D', 'd'], ['E', 'e'],
+                ['F', 'f'], ['G', 'g'], ['H', 'h'], ['J', 'j'], ['K', 'k'],
+                ['L', 'l'], ['M', 'm'], ['N', 'n'], ['P', 'p'], ['Q', 'q'],
+                ['R', 'r'], ['S', 's'], ['T', 't'], ['U', 'u'], ['V', 'v'],
+                ['W', 'w'], ['X', 'x'], ['Y', 'y'], ['Z', 'z'],
+            ]
+            
+            # Criar mapeamento de similaridade
+            self.similarity_map = {}
+            for group in self.similar_groups:
+                for char1 in group:
+                    for char2 in group:
+                        if char1 != char2:
+                            self.similarity_map[(char1, char2)] = True
+            
+            logger.info(f"✓ Similarity groups configured: {len(self.similar_groups)} groups")
+            logger.info(f"✓ Similar character pairs: {len(self.similarity_map)}")
         
-        def forward(self, logits, targets):
+        def get_similarity_weight(self, predicted_text, true_text):
+            """Calcular peso baseado na similaridade entre caracteres"""
+            if len(predicted_text) != len(true_text):
+                return 1.0  # Peso normal para erros de comprimento
+            
+            total_weight = 0.0
+            error_count = 0
+            
+            for pred_char, true_char in zip(predicted_text, true_text):
+                if pred_char != true_char:
+                    error_count += 1
+                    # Verificar se é erro entre caracteres similares
+                    if (pred_char, true_char) in self.similarity_map or (true_char, pred_char) in self.similarity_map:
+                        total_weight += self.similarity_weight  # Peso maior para similares
+                    else:
+                        total_weight += 1.0  # Peso normal
+            
+            return total_weight / max(error_count, 1)  # Média dos pesos
+        
+        def forward(self, logits, targets, pixel_values=None):
             logits = logits.view(-1, logits.size(-1))
             targets = targets.view(-1)
             
@@ -434,15 +501,55 @@ def train_anti_overfitting():
             logits = logits[mask]
             targets = targets[mask]
             
-            # Label smoothing
+            # Loss básico com label smoothing
             log_probs = torch.log_softmax(logits, dim=-1)
             nll_loss = -log_probs.gather(dim=-1, index=targets.unsqueeze(1)).squeeze(1)
             smooth_loss = -log_probs.mean(dim=-1)
             
-            loss = self.confidence * nll_loss + self.smoothing * smooth_loss
-            return loss.mean()
+            base_loss = self.confidence * nll_loss + self.smoothing * smooth_loss
+            
+            # Aplicar ponderação por similaridade se possível
+            if pixel_values is not None:
+                try:
+                    # Obter predições para calcular pesos
+                    predicted_ids = torch.argmax(logits, dim=-1)
+                    
+                    # Reshape para sequências
+                    batch_size = pixel_values.size(0)
+                    seq_len = len(targets) // batch_size
+                    
+                    if len(targets) % batch_size == 0:
+                        pred_sequences = predicted_ids.view(batch_size, seq_len)
+                        true_sequences = targets.view(batch_size, seq_len)
+                        loss_sequences = base_loss.view(batch_size, seq_len)
+                        
+                        weighted_losses = []
+                        
+                        for i in range(batch_size):
+                            pred_seq = pred_sequences[i]
+                            true_seq = true_sequences[i]
+                            loss_seq = loss_sequences[i]
+                            
+                            # Converter para texto
+                            pred_text = self.processor.tokenizer.decode(pred_seq, skip_special_tokens=True)
+                            true_text = self.processor.tokenizer.decode(true_seq, skip_special_tokens=True)
+                            
+                            # Calcular peso
+                            weight = self.get_similarity_weight(pred_text, true_text)
+                            
+                            # Aplicar peso
+                            weighted_loss = loss_seq * weight
+                            weighted_losses.append(weighted_loss.mean())
+                        
+                        return torch.stack(weighted_losses).mean()
+                    
+                except Exception as e:
+                    # Em caso de erro, usar loss básico
+                    pass
+            
+            return base_loss.mean()
     
-    criterion = LabelSmoothingCrossEntropy(LABEL_SMOOTHING)
+    criterion = WeightedLabelSmoothingCrossEntropy(processor, LABEL_SMOOTHING, similarity_weight=SIMILARITY_WEIGHT)
     
     # Training
     logger.info("\n" + "="*60)
@@ -474,7 +581,7 @@ def train_anti_overfitting():
             pixel_values.requires_grad = False  # Input não precisa de gradiente
             
             outputs = model(pixel_values=pixel_values, labels=labels)
-            loss = criterion(outputs.logits, labels)
+            loss = criterion(outputs.logits, labels, pixel_values)
             
             # Verificar se loss requer gradiente
             if not loss.requires_grad:
@@ -514,7 +621,7 @@ def train_anti_overfitting():
                 
                 # Loss
                 outputs = model(pixel_values=pixel_values, labels=labels)
-                loss = criterion(outputs.logits, labels)
+                loss = criterion(outputs.logits, labels, pixel_values)
                 val_loss += loss.item()
                 
                 # Generate - método simplificado
@@ -594,7 +701,7 @@ def train_anti_overfitting():
             model.save_pretrained(best_model_dir)
             processor.save_pretrained(best_model_dir)
             
-            logger.info(f"✅ New best model saved! Accuracy: {best_accuracy:.2%}")
+            logger.info(f"✅ Novo modelo salvo: {best_accuracy:.2%}")
         else:
             patience_counter += 1
             if patience_counter >= PATIENCE:
@@ -627,11 +734,11 @@ def train_anti_overfitting():
     
     # Final analysis
     logger.info("\n" + "="*60)
-    logger.info("TRAINING COMPLETE")
+    logger.info("TRAINING COMPLETO")
     logger.info("="*60)
-    logger.info(f"Best accuracy: {best_accuracy:.2%}")
-    logger.info(f"Best model saved at: {os.path.join(OUTPUT_DIR, 'best_model')}")
-    logger.info(f"Checkpoints saved at: {os.path.join(OUTPUT_DIR, 'checkpoints')}")
+    logger.info(f"Melhor acuracia: {best_accuracy:.2%}")
+    logger.info(f"Melhor modelo salvo: {os.path.join(OUTPUT_DIR, 'best_model')}")
+    logger.info(f"Checkpoint salvo: {os.path.join(OUTPUT_DIR, 'checkpoints')}")
     
     if len(train_losses) > 0 and len(val_losses) > 0:
         final_gap = val_losses[-1] - train_losses[-1]
