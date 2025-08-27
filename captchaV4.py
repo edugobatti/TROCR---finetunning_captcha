@@ -50,7 +50,7 @@ def adicionar_ruido(imagem: Image.Image) -> Image.Image:
 
     return imagem
 
-def gerar_captchas_com_letras_pretas(qtd_imagens: int, pasta_destino: str = "captchas"):
+def gerar_captchas_com_letras_pretas(qtd_imagens: int, pasta_destino: str = "trocr-camada-3"):
     os.makedirs(pasta_destino, exist_ok=True)
     image = ImageCaptcha(width=280, height=90)
 
@@ -64,4 +64,4 @@ def gerar_captchas_com_letras_pretas(qtd_imagens: int, pasta_destino: str = "cap
         caminho_arquivo = os.path.join(pasta_destino, f"{texto}.png")
         img.save(caminho_arquivo)
 
-gerar_captchas_com_letras_pretas(50000)
+gerar_captchas_com_letras_pretas(1004)
