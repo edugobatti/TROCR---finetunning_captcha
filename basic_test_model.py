@@ -9,7 +9,7 @@ class CaptchaSafetensorsPredictor:
         """
         Inicializa o preditor carregando o modelo da pasta especificada
         """
-        print(f"🔄 Carregando modelo de: {model_path}")
+        print(f" Carregando modelo de: {model_path}")
         
         # Verifica se a pasta existe
         if not os.path.exists(model_path):
@@ -19,7 +19,7 @@ class CaptchaSafetensorsPredictor:
         self.processor = TrOCRProcessor.from_pretrained(model_path)
         self.model = VisionEncoderDecoderModel.from_pretrained(model_path)
         
-        print("✅ Modelo carregado com sucesso!")
+        print(" Modelo carregado com sucesso!")
     
     def predict(self, image_path):
         """
@@ -76,7 +76,7 @@ def test_multiple_captchas(folder_path="captchas_teste", use_tta=True):
     
     # Verifica se a pasta existe
     if not os.path.exists(folder_path):
-        print(f"❌ Pasta '{folder_path}' não encontrada!")
+        print(f"Pasta '{folder_path}' não encontrada!")
         return
     
     # Lista todas as imagens na pasta
@@ -84,12 +84,12 @@ def test_multiple_captchas(folder_path="captchas_teste", use_tta=True):
     image_files = [f for f in os.listdir(folder_path) if f.endswith(image_extensions)]
     
     if not image_files:
-        print(f"❌ Nenhuma imagem encontrada na pasta '{folder_path}'!")
+        print(f"Nenhuma imagem encontrada na pasta '{folder_path}'!")
         return
     
     print(f"\n📁 Pasta: {folder_path}")
-    print(f"📷 Total de imagens encontradas: {len(image_files)}")
-    print(f"🔄 Modo: {'Com TTA (5 predições por imagem)' if use_tta else 'Predição simples'}")
+    print(f" Total de imagens encontradas: {len(image_files)}")
+    print(f" Modo: {'Com TTA (5 predições por imagem)' if use_tta else 'Predição simples'}")
     print("-"*70)
     
     try:
@@ -136,35 +136,35 @@ def test_multiple_captchas(folder_path="captchas_teste", use_tta=True):
             # Mostrar resultado
             print(f"   Esperado: {expected_text}")
             print(f"   Predito:  {predicted_text}")
-            print(f"   Status:   {'✅ CORRETO' if is_correct else '❌ INCORRETO'}")
+            print(f"   Status:   {' CORRETO' if is_correct else 'INCORRETO'}")
         
         # Estatísticas finais
         accuracy = (total_correct / total_images) * 100
         
         print("\n" + "="*70)
-        print("📊 RESULTADO FINAL")
+        print("RESULTADO FINAL")
         print("="*70)
-        print(f"✅ Acertos: {total_correct}/{total_images}")
-        print(f"📈 Acurácia: {accuracy:.2f}%")
+        print(f" Acertos: {total_correct}/{total_images}")
+        print(f" Acurácia: {accuracy:.2f}%")
         
         # Mostrar erros
         errors = [r for r in results if not r['correto']]
         if errors:
-            print(f"\n❌ Erros ({len(errors)} total):")
+            print(f"\nErros ({len(errors)} total):")
             for err in errors:
                 print(f"   {err['arquivo']}: esperado '{err['esperado']}' → obtido '{err['predito']}'")
         
         # Mostrar estatísticas de confiança (se usando TTA)
         if use_tta:
             avg_confidence = sum(r['confianca'] for r in results) / len(results)
-            print(f"\n📊 Confiança média: {avg_confidence:.1%}")
+            print(f"\nConfiança média: {avg_confidence:.1%}")
             
             # Separar por níveis de confiança
             high_conf = [r for r in results if r['confianca'] >= 0.8]
             med_conf = [r for r in results if 0.6 <= r['confianca'] < 0.8]
             low_conf = [r for r in results if r['confianca'] < 0.6]
             
-            print(f"\n📈 Distribuição de confiança:")
+            print(f"\n Distribuição de confiança:")
             print(f"   Alta (≥80%): {len(high_conf)} imagens")
             print(f"   Média (60-79%): {len(med_conf)} imagens")
             print(f"   Baixa (<60%): {len(low_conf)} imagens")
@@ -174,7 +174,7 @@ def test_multiple_captchas(folder_path="captchas_teste", use_tta=True):
         return results
         
     except Exception as e:
-        print(f"\n❌ Erro: {e}")
+        print(f"\nErro: {e}")
         import traceback
         traceback.print_exc()
         return None
@@ -185,13 +185,13 @@ def test_captcha(image_path=None):
     Função para testar um único captcha
     """
     if image_path is None:
-        print("❌ Caminho da imagem não especificado!")
+        print("Caminho da imagem não especificado!")
         return None
     
     try:
         predictor = CaptchaSafetensorsPredictor(model_path="trocr-anti-overfit-final-100k")
         
-        print(f"\n📷 Testando: {image_path}")
+        print(f"\n Testando: {image_path}")
         result, time_taken = predictor.predict(image_path)
         print(f"Resultado: {result}")
         print(f"Tempo: {time_taken:.3f}s")
@@ -199,7 +199,7 @@ def test_captcha(image_path=None):
         return result
         
     except Exception as e:
-        print(f"\n❌ Erro: {e}")
+        print(f"\nErro: {e}")
         import traceback
         traceback.print_exc()
         return None

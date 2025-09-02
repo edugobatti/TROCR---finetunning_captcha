@@ -44,11 +44,11 @@ def setup_torch_serialization():
                     "numpy._globals",
                     "_codecs.encode"
                 ])
-                logger.info("✅ Configuração de serialização segura concluída")
+                logger.info(" Configuração de serialização segura concluída")
             else:
-                logger.warning("⚠️ torch.serialization.add_safe_globals não encontrado")
+                logger.warning(" torch.serialization.add_safe_globals não encontrado")
     except Exception as e:
-        logger.warning(f"⚠️ Erro ao configurar serialização do PyTorch: {e}")
+        logger.warning(f" Erro ao configurar serialização do PyTorch: {e}")
 
 # ============================================
 # FUNÇÃO PARA CARREGAR E CONVERTER IMAGENS
@@ -197,7 +197,7 @@ class AntiOverfittingDataset(Dataset):
                 logger.info(f"  {mode}: {count} imagens")
         
         if problematic_images:
-            logger.warning(f"⚠️ {len(problematic_images)} imagens problemáticas encontradas:")
+            logger.warning(f" {len(problematic_images)} imagens problemáticas encontradas:")
             for path, error in problematic_images[:5]:  # Mostrar apenas as primeiras 5
                 logger.warning(f"  {os.path.basename(path)}: {error}")
     
@@ -333,7 +333,7 @@ def save_checkpoint(model, optimizer, processor, epoch, best_accuracy, train_los
         'numpy_random_state': checkpoint_data['numpy_random_state']
     }, os.path.join(checkpoint_dir, f"training_states_epoch_{epoch}.pth"))
     
-    logger.info(f"✅ Checkpoint saved for epoch {epoch}")
+    logger.info(f" Checkpoint saved for epoch {epoch}")
     
     # Limpar checkpoints antigos (manter apenas os 3 mais recentes)
     cleanup_old_checkpoints(checkpoint_dir, keep_last=3)
@@ -386,14 +386,14 @@ def load_latest_checkpoint(output_dir):
     
     # Verificar se a pasta existe
     if not os.path.exists(checkpoint_dir):
-        logger.warning(f"❌ Pasta de checkpoints não encontrada: {checkpoint_dir}")
+        logger.warning(f"Pasta de checkpoints não encontrada: {checkpoint_dir}")
         return None
     
     # Listar todos os arquivos JSON de estado
     json_files = glob.glob(os.path.join(checkpoint_dir, "training_state_epoch_*.json"))
     
     if not json_files:
-        logger.warning(f"❌ Nenhum arquivo de checkpoint encontrado em {checkpoint_dir}")
+        logger.warning(f"Nenhum arquivo de checkpoint encontrado em {checkpoint_dir}")
         return None
     
     logger.info(f"Arquivos de checkpoint encontrados: {len(json_files)}")
@@ -416,10 +416,10 @@ def load_latest_checkpoint(output_dir):
             continue
     
     if latest_file is None:
-        logger.warning("❌ Não foi possível determinar o checkpoint mais recente")
+        logger.warning("Não foi possível determinar o checkpoint mais recente")
         return None
     
-    logger.info(f"✅ Checkpoint mais recente encontrado: {latest_file} (epoch {latest_epoch})")
+    logger.info(f" Checkpoint mais recente encontrado: {latest_file} (epoch {latest_epoch})")
     
     try:
         # Carregar dados do JSON
@@ -473,23 +473,23 @@ def load_latest_checkpoint(output_dir):
                     states = torch.load(states_file, map_location='cpu')
                 
                 checkpoint_data.update(states)
-                logger.info("✅ Estados do treinamento carregados com sucesso")
+                logger.info(" Estados do treinamento carregados com sucesso")
             except Exception as e:
-                logger.warning(f"❌ Erro ao carregar arquivo de estados: {e}")
-                logger.warning("⚠️ Continuando sem estados do optimizer e RNG")
+                logger.warning(f"Erro ao carregar arquivo de estados: {e}")
+                logger.warning(" Continuando sem estados do optimizer e RNG")
                 logger.warning("O treinamento pode não ser exatamente continuado do ponto onde parou")
                 import traceback
                 traceback.print_exc()
         else:
-            logger.warning(f"❌ Arquivo de estados não encontrado: {states_file}")
+            logger.warning(f"Arquivo de estados não encontrado: {states_file}")
         
         # Caminho para o modelo
         model_path = os.path.join(checkpoint_dir, f"checkpoint_epoch_{latest_epoch}")
         if os.path.exists(model_path):
-            logger.info(f"✅ Pasta do modelo encontrada: {model_path}")
+            logger.info(f" Pasta do modelo encontrada: {model_path}")
             checkpoint_data['model_path'] = model_path
         else:
-            logger.warning(f"❌ Pasta do modelo não encontrada: {model_path}")
+            logger.warning(f"Pasta do modelo não encontrada: {model_path}")
         
         return checkpoint_data
         
@@ -554,7 +554,7 @@ def train_anti_overfitting():
     # Se encontrou checkpoint, configurar o treinamento para continuar de onde parou
     if checkpoint:
         logger.info("\n" + "="*60)
-        logger.info(f"🔄 CONTINUANDO TREINAMENTO DO CHECKPOINT")
+        logger.info(f" CONTINUANDO TREINAMENTO DO CHECKPOINT")
         logger.info("="*60)
         logger.info(f"Epoch inicial: {checkpoint.get('epoch', 'desconhecido') + 1}")
         logger.info(f"Melhor acurácia até agora: {checkpoint.get('best_accuracy', 0):.2%}")
@@ -562,55 +562,55 @@ def train_anti_overfitting():
         # Restaurar variáveis de estado do treinamento
         if 'epoch' in checkpoint:
             start_epoch = checkpoint['epoch'] + 1
-            logger.info(f"✅ Epoch configurado para {start_epoch}")
+            logger.info(f" Epoch configurado para {start_epoch}")
         else:
-            logger.warning("❌ Checkpoint não tem informação de epoch")
+            logger.warning("Checkpoint não tem informação de epoch")
             
         if 'best_accuracy' in checkpoint:
             best_accuracy = checkpoint['best_accuracy']
-            logger.info(f"✅ Melhor acurácia configurada para {best_accuracy:.2%}")
+            logger.info(f" Melhor acurácia configurada para {best_accuracy:.2%}")
         else:
-            logger.warning("❌ Checkpoint não tem informação de melhor acurácia")
+            logger.warning("Checkpoint não tem informação de melhor acurácia")
             
         if 'patience_counter' in checkpoint:
             patience_counter = checkpoint['patience_counter']
-            logger.info(f"✅ Contador de paciência configurado para {patience_counter}")
+            logger.info(f" Contador de paciência configurado para {patience_counter}")
         else:
-            logger.warning("❌ Checkpoint não tem informação de contador de paciência")
+            logger.warning("Checkpoint não tem informação de contador de paciência")
             
         if 'train_losses' in checkpoint:
             train_losses = checkpoint['train_losses']
-            logger.info(f"✅ Histórico de loss de treino carregado ({len(train_losses)} epochs)")
+            logger.info(f" Histórico de loss de treino carregado ({len(train_losses)} epochs)")
         else:
-            logger.warning("❌ Checkpoint não tem histórico de loss de treino")
+            logger.warning("Checkpoint não tem histórico de loss de treino")
             
         if 'val_losses' in checkpoint:
             val_losses = checkpoint['val_losses']
-            logger.info(f"✅ Histórico de loss de validação carregado ({len(val_losses)} epochs)")
+            logger.info(f" Histórico de loss de validação carregado ({len(val_losses)} epochs)")
         else:
-            logger.warning("❌ Checkpoint não tem histórico de loss de validação")
+            logger.warning("Checkpoint não tem histórico de loss de validação")
         
         # Restaurar estados aleatórios
         if 'random_state' in checkpoint:
             try:
                 random.setstate(checkpoint['random_state'])
-                logger.info("✅ Estado aleatório do Python restaurado")
+                logger.info(" Estado aleatório do Python restaurado")
             except Exception as e:
-                logger.warning(f"❌ Erro ao restaurar estado aleatório do Python: {e}")
+                logger.warning(f"Erro ao restaurar estado aleatório do Python: {e}")
                 
         if 'torch_random_state' in checkpoint:
             try:
                 torch.set_rng_state(torch.tensor(checkpoint['torch_random_state'], dtype=torch.uint8))
-                logger.info("✅ Estado aleatório do PyTorch restaurado")
+                logger.info(" Estado aleatório do PyTorch restaurado")
             except Exception as e:
-                logger.warning(f"❌ Erro ao restaurar estado aleatório do PyTorch: {e}")
+                logger.warning(f"Erro ao restaurar estado aleatório do PyTorch: {e}")
                 
         if 'numpy_random_state' in checkpoint:
             try:
                 np.random.set_state(checkpoint['numpy_random_state'])
-                logger.info("✅ Estado aleatório do NumPy restaurado")
+                logger.info(" Estado aleatório do NumPy restaurado")
             except Exception as e:
-                logger.warning(f"❌ Erro ao restaurar estado aleatório do NumPy: {e}")
+                logger.warning(f"Erro ao restaurar estado aleatório do NumPy: {e}")
     else:
         logger.info("\n" + "="*60)
         logger.info("🆕 INICIANDO NOVO TREINAMENTO")
@@ -654,12 +654,12 @@ def train_anti_overfitting():
     logger.info(f"Total de imagens válidas: {len(image_paths)}")
     
     if problematic_files:
-        logger.warning(f"⚠️ {len(problematic_files)} arquivos problemáticos foram ignorados")
+        logger.warning(f" {len(problematic_files)} arquivos problemáticos foram ignorados")
         for filename, error in problematic_files[:5]:  # Mostrar apenas os primeiros 5
             logger.warning(f"  {filename}: {error}")
     
     if len(image_paths) == 0:
-        logger.error("❌ Nenhuma imagem válida encontrada!")
+        logger.error("Nenhuma imagem válida encontrada!")
         return
     
     # Split (com seed fixo para consistência)
@@ -679,9 +679,9 @@ def train_anti_overfitting():
         try:
             processor = TrOCRProcessor.from_pretrained(checkpoint['model_path'])
             model = VisionEncoderDecoderModel.from_pretrained(checkpoint['model_path'])
-            logger.info("✅ Modelo e processor carregados com sucesso do checkpoint")
+            logger.info(" Modelo e processor carregados com sucesso do checkpoint")
         except Exception as e:
-            logger.error(f"❌ Erro ao carregar modelo do checkpoint: {e}")
+            logger.error(f"Erro ao carregar modelo do checkpoint: {e}")
             logger.info(f"\nCarregando modelo base: {MODEL_NAME}")
             processor = TrOCRProcessor.from_pretrained(MODEL_NAME)
             model = VisionEncoderDecoderModel.from_pretrained(MODEL_NAME)
@@ -699,7 +699,7 @@ def train_anti_overfitting():
             if new_tokens:
                 processor.tokenizer.add_tokens(new_tokens)
                 model.decoder.resize_token_embeddings(len(processor.tokenizer))
-                logger.info(f"✅ Adicionados {len(new_tokens)} novos tokens")
+                logger.info(f" Adicionados {len(new_tokens)} novos tokens")
     else:
         logger.info(f"\n" + "="*60)
         logger.info(f"CARREGANDO MODELO BASE")
@@ -722,7 +722,7 @@ def train_anti_overfitting():
         if new_tokens:
             processor.tokenizer.add_tokens(new_tokens)
             model.decoder.resize_token_embeddings(len(processor.tokenizer))
-            logger.info(f"✅ Adicionados {len(new_tokens)} novos tokens")
+            logger.info(f" Adicionados {len(new_tokens)} novos tokens")
     
     # Configurar modelo completamente
     model.config.decoder_start_token_id = processor.tokenizer.cls_token_id or processor.tokenizer.bos_token_id
@@ -784,9 +784,9 @@ def train_anti_overfitting():
     if checkpoint and 'optimizer_state_dict' in checkpoint:
         try:
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            logger.info("✅ Estado do optimizer restaurado com sucesso")
+            logger.info(" Estado do optimizer restaurado com sucesso")
         except Exception as e:
-            logger.warning(f"❌ Erro ao restaurar estado do optimizer: {e}")
+            logger.warning(f"Erro ao restaurar estado do optimizer: {e}")
     
     # Loss com label smoothing e ponderação por similaridade
     class WeightedLabelSmoothingCrossEntropy(nn.Module):
@@ -1073,7 +1073,7 @@ def train_anti_overfitting():
             model.save_pretrained(best_model_dir)
             processor.save_pretrained(best_model_dir)
             
-            logger.info(f"✅ Novo modelo salvo: {best_accuracy:.2%}")
+            logger.info(f" Novo modelo salvo: {best_accuracy:.2%}")
         else:
             patience_counter += 1
             if patience_counter >= PATIENCE:
@@ -1118,13 +1118,13 @@ def train_anti_overfitting():
         logger.info(f"Final gap (Val-Train): {final_gap:.4f}")
         
         if final_gap < 0.5:
-            logger.info("✅ Excellent! Minimal overfitting.")
+            logger.info(" Excellent! Minimal overfitting.")
         elif final_gap < 1.0:
             logger.info("✓ Good! Controlled overfitting.")
         elif final_gap < 2.0:
-            logger.info("⚠️ Warning! Moderate overfitting.")
+            logger.info(" Warning! Moderate overfitting.")
         else:
-            logger.info("❌ Significant overfitting detected!")
+            logger.info("Significant overfitting detected!")
 
 if __name__ == "__main__":
     try:

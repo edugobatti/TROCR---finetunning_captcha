@@ -18,6 +18,7 @@ import glob
 import cv2
 import warnings
 import copy
+import cv2
 warnings.filterwarnings('ignore')
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -44,9 +45,9 @@ def setup_torch_serialization():
                     "numpy._globals",
                     "_codecs.encode"
                 ])
-                logger.info("✅ Configuração de serialização segura concluída")
+                logger.info(" Configuração de serialização segura concluída")
     except Exception as e:
-        logger.warning(f"⚠️ Erro ao configurar serialização: {e}")
+        logger.warning(f" Erro ao configurar serialização: {e}")
 
 # ============================================
 # ELASTIC WEIGHT CONSOLIDATION (EWC)
@@ -389,15 +390,15 @@ def incremental_training():
     setup_torch_serialization()
     
     # ====== CONFIGURAÇÕES PARA APRENDIZADO INCREMENTAL ======
-    BASE_MODEL_PATH = "./best-model"           # Modelo base treinado
+    BASE_MODEL_PATH = "./trocr-incremental-9/best_model"           # Modelo base treinado
     OLD_DATASET_PATH = "./captcha-full"            # Dataset original (para replay)
-    NEW_DATASET_PATH = "./trocr-camada-3"      # Novo dataset complexo
-    OUTPUT_DIR = "./trocr-incremental-3"         # Diretório de saída
+    NEW_DATASET_PATH = "./img_base_captcha"      # Novo dataset complexo
+    OUTPUT_DIR = "./trocr-incremental-10"         # Diretório de saída
     
     # Hiperparâmetros otimizados para preservar conhecimento
-    BATCH_SIZE = 2
-    GRADIENT_ACCUMULATION = 32
-    LEARNING_RATE = 8e-5                       # LR bem menor para não esquecer
+    BATCH_SIZE = 1
+    GRADIENT_ACCUMULATION = 64
+    LEARNING_RATE = 1.5e-4                       # LR bem menor para não esquecer
     MIN_LR = 1e-7
     WEIGHT_DECAY = 0.01
     
@@ -407,34 +408,34 @@ def incremental_training():
     
     # Parâmetros de preservação de conhecimento
     USE_EWC = True                             # Elastic Weight Consolidation
-    EWC_LAMBDA = 0.2                           # Importância do conhecimento anterior
+    EWC_LAMBDA = 0.8                           # Importância do conhecimento anterior
     
     USE_DISTILLATION = True                    # Knowledge Distillation
     DISTILLATION_ALPHA = 0.6                   # Balance entre novo e antigo
     DISTILLATION_TEMPERATURE = 4.0
     
     USE_REPLAY = True                          # Experience Replay
-    REPLAY_RATIO = 0.4                         # 30% dados antigos, 70% novos
-    REPLAY_BUFFER_SIZE = 1000
+    REPLAY_RATIO = 0.3                         # treino 40/60 40 antigas ,60 novas (%)
+    REPLAY_BUFFER_SIZE = 2000
     
-    LABEL_SMOOTHING = 0.05
-    AUGMENT_PROB = 0.3                         # Menos augmentation
+    LABEL_SMOOTHING = 0.02
+    AUGMENT_PROB = 0.9                        # Menos augmentation
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     logger.info("="*70)
     logger.info("TREINAMENTO INCREMENTAL - PRESERVANDO CONHECIMENTO")
     logger.info("="*70)
-    logger.info(f"🔧 Device: {device}")
-    logger.info(f"📂 Modelo base: {BASE_MODEL_PATH}")
-    logger.info(f"📂 Dataset antigo: {OLD_DATASET_PATH}")
-    logger.info(f"📂 Dataset novo: {NEW_DATASET_PATH}")
-    logger.info(f"📂 Output: {OUTPUT_DIR}")
-    logger.info(f"⚙️ Batch size: {BATCH_SIZE} (x{GRADIENT_ACCUMULATION} accumulation)")
-    logger.info(f"⚙️ Learning rate: {LEARNING_RATE}")
-    logger.info(f"🛡️ EWC: {USE_EWC} (λ={EWC_LAMBDA})")
-    logger.info(f"🧪 Distillation: {USE_DISTILLATION} (α={DISTILLATION_ALPHA})")
-    logger.info(f"🔄 Replay: {USE_REPLAY} (ratio={REPLAY_RATIO})")
+    logger.info(f" Device: {device}")
+    logger.info(f" Modelo base: {BASE_MODEL_PATH}")
+    logger.info(f" Dataset antigo: {OLD_DATASET_PATH}")
+    logger.info(f" Dataset novo: {NEW_DATASET_PATH}")
+    logger.info(f" Output: {OUTPUT_DIR}")
+    logger.info(f" Batch size: {BATCH_SIZE} (x{GRADIENT_ACCUMULATION} accumulation)")
+    logger.info(f" Learning rate: {LEARNING_RATE}")
+    logger.info(f" EWC: {USE_EWC} (λ={EWC_LAMBDA})")
+    logger.info(f" Distillation: {USE_DISTILLATION} (α={DISTILLATION_ALPHA})")
+    logger.info(f" Replay: {USE_REPLAY} (ratio={REPLAY_RATIO})")
     
     # Criar diretórios
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -448,7 +449,7 @@ def incremental_training():
     try:
         processor = TrOCRProcessor.from_pretrained(BASE_MODEL_PATH)
         student_model = VisionEncoderDecoderModel.from_pretrained(BASE_MODEL_PATH)
-        logger.info("✅ Modelo base carregado com sucesso")
+        logger.info(" Modelo base carregado com sucesso")
         
         # Criar modelo teacher (frozen)
         if USE_DISTILLATION:
@@ -457,12 +458,12 @@ def incremental_training():
             teacher_model.eval()
             for param in teacher_model.parameters():
                 param.requires_grad = False
-            logger.info("✅ Modelo teacher criado e congelado")
+            logger.info(" Modelo teacher criado e congelado")
         else:
             teacher_model = None
             
     except Exception as e:
-        logger.error(f"❌ Erro ao carregar modelo base: {e}")
+        logger.error(f"Erro ao carregar modelo base: {e}")
         return
     
     # Configurar student model
@@ -487,7 +488,7 @@ def incremental_training():
                     old_image_paths.append(image_path)
                     old_labels.append(label)
         
-        logger.info(f"📊 Dataset antigo: {len(old_image_paths)} imagens")
+        logger.info(f"Dataset antigo: {len(old_image_paths)} imagens")
     
     # Carregar novo dataset
     new_image_paths = []
@@ -501,7 +502,7 @@ def incremental_training():
                 new_image_paths.append(image_path)
                 new_labels.append(label)
     
-    logger.info(f"📊 Dataset novo: {len(new_image_paths)} imagens")
+    logger.info(f"Dataset novo: {len(new_image_paths)} imagens")
     
     # Criar replay buffer
     replay_buffer = ReplayBuffer(REPLAY_BUFFER_SIZE)
@@ -515,14 +516,14 @@ def incremental_training():
         for idx in old_indices:
             replay_buffer.add(old_image_paths[idx], old_labels[idx])
         
-        logger.info(f"🔄 Replay buffer: {len(replay_buffer.buffer)} exemplos antigos")
+        logger.info(f" Replay buffer: {len(replay_buffer.buffer)} exemplos antigos")
     
     # Combinar datasets
     if USE_REPLAY and len(replay_buffer.buffer) > 0:
         replay_paths, replay_labels = replay_buffer.get_all()
         combined_paths = new_image_paths + replay_paths
         combined_labels = new_labels + replay_labels
-        logger.info(f"📊 Dataset combinado: {len(combined_paths)} imagens total")
+        logger.info(f"Dataset combinado: {len(combined_paths)} imagens total")
     else:
         combined_paths = new_image_paths
         combined_labels = new_labels
@@ -537,21 +538,21 @@ def incremental_training():
         student_model.decoder.resize_token_embeddings(len(processor.tokenizer))
         if teacher_model:
             teacher_model.decoder.resize_token_embeddings(len(processor.tokenizer))
-        logger.info(f"✅ Adicionados {len(new_tokens)} novos tokens")
+        logger.info(f" Adicionados {len(new_tokens)} novos tokens")
     
     # Split do dataset
     train_paths, val_paths, train_labels, val_labels = train_test_split(
         combined_paths, combined_labels, test_size=0.15, random_state=42
     )
     
-    logger.info(f"📊 Split final:")
+    logger.info(f"Split final:")
     logger.info(f"   Treino: {len(train_paths)} imagens")
     logger.info(f"   Validação: {len(val_paths)} imagens")
     
     # ====== CALCULAR EWC SE NECESSÁRIO ======
     ewc = None
     if USE_EWC and len(old_image_paths) > 0:
-        logger.info("\n🧮 Calculando Fisher Information Matrix para EWC...")
+        logger.info("\n Calculando Fisher Information Matrix para EWC...")
         
         # Criar dataset temporário com dados antigos
         ewc_dataset = IncrementalCaptchaDataset(
@@ -560,7 +561,7 @@ def incremental_training():
         ewc_loader = DataLoader(ewc_dataset, batch_size=BATCH_SIZE, shuffle=False)
         
         ewc = EWC(student_model, ewc_loader, device)
-        logger.info("✅ EWC configurado")
+        logger.info(" EWC configurado")
     
     # ====== CRIAR DATASETS E DATALOADERS ======
     train_dataset = IncrementalCaptchaDataset(
@@ -756,16 +757,16 @@ def incremental_training():
         
         # ====== LOG METRICS ======
         logger.info(f"\n{'='*70}")
-        logger.info(f"📊 Epoch {epoch+1}/{NUM_EPOCHS} ({epoch_time:.1f}s)")
-        logger.info(f"📉 Loss - Train: {avg_train_loss:.4f}, Val: {avg_val_loss:.4f}")
-        logger.info(f"📈 Accuracy Total: {accuracy:.2%}")
+        logger.info(f"Epoch {epoch+1}/{NUM_EPOCHS} ({epoch_time:.1f}s)")
+        logger.info(f" Loss - Train: {avg_train_loss:.4f}, Val: {avg_val_loss:.4f}")
+        logger.info(f" Accuracy Total: {accuracy:.2%}")
         logger.info(f"   └─ Dados Antigos: {old_accuracy:.2%} ({old_total} exemplos)")
         logger.info(f"   └─ Dados Novos: {new_accuracy:.2%} ({new_total} exemplos)")
         
         if USE_EWC and ewc_loss_total > 0:
-            logger.info(f"🛡️ EWC Penalty médio: {ewc_loss_total/len(train_loader):.4f}")
+            logger.info(f" EWC Penalty médio: {ewc_loss_total/len(train_loader):.4f}")
         if USE_DISTILLATION and kd_loss_total > 0:
-            logger.info(f"🧪 KD Loss médio: {kd_loss_total/len(train_loader):.4f}")
+            logger.info(f" KD Loss médio: {kd_loss_total/len(train_loader):.4f}")
         
         # ====== SALVAR CHECKPOINT ======
         if accuracy > best_accuracy:
@@ -797,47 +798,39 @@ def incremental_training():
             with open(os.path.join(best_model_path, "metrics.json"), 'w') as f:
                 json.dump(metrics, f, indent=2)
             
-            logger.info(f"🏆 Novo melhor modelo: {best_accuracy:.2%}")
+            logger.info(f"-----> Novo melhor modelo: {best_accuracy:.2%}")
         else:
             patience_counter += 1
             if patience_counter >= PATIENCE:
-                logger.info(f"\n⏹️ Early stopping após {PATIENCE} epochs sem melhoria")
+                logger.info(f"\n Early stopping após {PATIENCE} epochs sem melhoria")
                 break
     
     # ====== ANÁLISE FINAL ======
     logger.info("\n" + "="*70)
-    logger.info("🎯 TREINAMENTO INCREMENTAL COMPLETO!")
+    logger.info(" TREINAMENTO INCREMENTAL COMPLETO!")
     logger.info("="*70)
-    logger.info(f"📊 Melhor acurácia total: {best_accuracy:.2%}")
-    logger.info(f"📂 Modelo salvo em: {os.path.join(OUTPUT_DIR, 'best_model')}")
+    logger.info(f"Melhor acurácia total: {best_accuracy:.2%}")
+    logger.info(f" Modelo salvo em: {os.path.join(OUTPUT_DIR, 'best_model')}")
     
     # Análise de catastrophic forgetting
     if old_total > 0 and new_total > 0:
-        logger.info(f"\n📈 Análise de Preservação de Conhecimento:")
+        logger.info(f"\n Análise de Preservação de Conhecimento:")
         logger.info(f"   Performance em dados antigos: {old_accuracy:.2%}")
         logger.info(f"   Performance em dados novos: {new_accuracy:.2%}")
         
         if old_accuracy > 0.7:
-            logger.info("   ✅ Excelente preservação do conhecimento anterior!")
+            logger.info("    Excelente preservação do conhecimento anterior!")
         elif old_accuracy > 0.5:
-            logger.info("   ⚠️ Alguma perda de conhecimento anterior detectada")
+            logger.info("    Alguma perda de conhecimento anterior detectada")
         else:
-            logger.info("   ❌ Catastrophic forgetting significativo")
+            logger.info("   Catastrophic forgetting significativo")
 
 if __name__ == "__main__":
-    try:
-        # Instalar dependências se necessário
-        try:
-            import cv2
-        except ImportError:
-            logger.info("Instalando opencv-python...")
-            os.system("pip install opencv-python")
-            import cv2
-        
+    try:       
         incremental_training()
     except KeyboardInterrupt:
-        logger.info("\n⏹️ Treinamento interrompido pelo usuário")
+        logger.info("\n Treinamento interrompido pelo usuário")
     except Exception as e:
-        logger.error(f"❌ Erro: {e}")
+        logger.error(f"Erro: {e}")
         import traceback
         traceback.print_exc()

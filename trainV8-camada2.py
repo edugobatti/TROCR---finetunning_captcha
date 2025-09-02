@@ -3,7 +3,9 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, ConcatDataset
+from torch.optim.lr_scheduler import OneCycleLR
 from transformers import TrOCRProcessor, VisionEncoderDecoderModel
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 import numpy as np
@@ -16,6 +18,7 @@ import json
 import glob
 import cv2
 import warnings
+import copy
 warnings.filterwarnings('ignore')
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -42,9 +45,187 @@ def setup_torch_serialization():
                     "numpy._globals",
                     "_codecs.encode"
                 ])
-                logger.info("✅ Configuração de serialização segura concluída")
+                logger.info("✓ Configuração de serialização segura concluída")
     except Exception as e:
-        logger.warning(f"⚠️ Erro ao configurar serialização: {e}")
+        logger.warning(f"⚠ Erro ao configurar serialização: {e}")
+
+# ============================================
+# METRICS TRACKER MELHORADO
+# ============================================
+class MetricsTracker:
+    """Rastreia métricas separadas para dados antigos e novos"""
+    def __init__(self):
+        self.reset()
+    
+    def reset(self):
+        self.metrics = {
+            'old_data': {'correct': 0, 'total': 0, 'losses': []},
+            'new_data': {'correct': 0, 'total': 0, 'losses': []},
+            'mixed_data': {'correct': 0, 'total': 0, 'losses': []}
+        }
+    
+    def update(self, pred, true, is_old_data, loss=None):
+        """Atualiza métricas baseado na origem dos dados"""
+        category = 'old_data' if is_old_data else 'new_data'
+        self.metrics[category]['total'] += 1
+        
+        if pred.strip().upper() == true.strip().upper():
+            self.metrics[category]['correct'] += 1
+        
+        if loss is not None:
+            self.metrics[category]['losses'].append(loss)
+    
+    def get_accuracies(self):
+        """Retorna acurácias separadas"""
+        results = {}
+        for category, data in self.metrics.items():
+            if data['total'] > 0:
+                results[f"{category}_acc"] = data['correct'] / data['total']
+                if data['losses']:
+                    results[f"{category}_loss"] = np.mean(data['losses'])
+            else:
+                results[f"{category}_acc"] = 0.0
+                results[f"{category}_loss"] = 0.0
+        return results
+
+# ============================================
+# ELASTIC WEIGHT CONSOLIDATION (EWC) MELHORADO
+# ============================================
+class EWC:
+    """Implementa Elastic Weight Consolidation para preservar conhecimento anterior"""
+    
+    def __init__(self, model, dataloader, device, fisher_estimation_sample_size=1000):
+        self.model = model
+        self.device = device
+        self.params = {n: p.clone().detach() for n, p in model.named_parameters() if p.requires_grad}
+        self.fisher = self._estimate_fisher(dataloader, fisher_estimation_sample_size)
+        
+    def _estimate_fisher(self, dataloader, sample_size):
+        """Estima a matriz de Fisher para importância dos parâmetros"""
+        fisher = {}
+        self.model.eval()
+        
+        sample_count = 0
+        for batch in tqdm(dataloader, desc="Estimando Fisher Matrix", leave=False):
+            if sample_count >= sample_size:
+                break
+                
+            pixel_values = batch['pixel_values'].to(self.device)
+            labels = batch['labels'].to(self.device)
+            
+            self.model.zero_grad()
+            outputs = self.model(pixel_values=pixel_values, labels=labels)
+            loss = outputs.loss
+            loss.backward()
+            
+            for n, p in self.model.named_parameters():
+                if p.requires_grad and p.grad is not None:
+                    if n not in fisher:
+                        fisher[n] = p.grad.data.clone().detach() ** 2
+                    else:
+                        fisher[n] += p.grad.data.clone().detach() ** 2
+            
+            sample_count += len(pixel_values)
+        
+        # Normalizar Fisher
+        for n in fisher:
+            fisher[n] /= sample_count
+            # Adicionar pequeno epsilon para estabilidade
+            fisher[n] += 1e-8
+            
+        self.model.train()
+        return fisher
+    
+    def penalty(self, model):
+        """Calcula penalidade EWC"""
+        loss = 0
+        for n, p in model.named_parameters():
+            if n in self.fisher:
+                loss += (self.fisher[n] * (p - self.params[n]) ** 2).sum()
+        return loss
+
+# ============================================
+# KNOWLEDGE DISTILLATION MELHORADO
+# ============================================
+class KnowledgeDistillationLoss(nn.Module):
+    """Loss de destilação para preservar conhecimento do modelo anterior"""
+    
+    def __init__(self, temperature=6.0, alpha=0.45):
+        super().__init__()
+        self.temperature = temperature
+        self.alpha = alpha
+        self.kl_div = nn.KLDivLoss(reduction='batchmean')
+        
+    def forward(self, student_logits, teacher_logits, labels, criterion):
+        """
+        Combina loss de destilação com loss supervisionado
+        alpha: peso para loss de destilação (45%)
+        (1-alpha): peso para loss supervisionado (55%)
+        """
+        # Loss supervisionado (novo dataset) - 55% de importância
+        hard_loss = criterion(student_logits, labels)
+        
+        # Loss de destilação (preservar conhecimento) - 45% de importância
+        soft_targets = F.log_softmax(student_logits / self.temperature, dim=-1)
+        soft_teacher = F.softmax(teacher_logits / self.temperature, dim=-1)
+        soft_loss = self.kl_div(soft_targets, soft_teacher) * (self.temperature ** 2)
+        
+        # Combinar losses
+        total_loss = self.alpha * soft_loss + (1 - self.alpha) * hard_loss
+        
+        return total_loss, hard_loss, soft_loss
+
+# ============================================
+# REPLAY BUFFER MELHORADO
+# ============================================
+class ReplayBuffer:
+    """Buffer para armazenar exemplos antigos e fazer rehearsal"""
+    
+    def __init__(self, max_size=3000):
+        self.max_size = max_size
+        self.buffer = []
+        
+    def add(self, image_path, label, priority=1.0):
+        """Adiciona exemplo ao buffer com prioridade"""
+        if len(self.buffer) >= self.max_size:
+            # Remover item com menor prioridade
+            min_idx = min(range(len(self.buffer)), 
+                         key=lambda i: self.buffer[i][2])
+            self.buffer.pop(min_idx)
+        self.buffer.append((image_path, label, priority))
+    
+    def sample(self, n):
+        """Amostra n exemplos do buffer com weighted sampling"""
+        if len(self.buffer) == 0:
+            return [], []
+        
+        n = min(n, len(self.buffer))
+        
+        # Weighted sampling baseado em prioridade
+        items = self.buffer
+        weights = [item[2] for item in items]
+        total_weight = sum(weights)
+        weights = [w/total_weight for w in weights]
+        
+        indices = np.random.choice(len(items), size=n, replace=False, p=weights)
+        samples = [items[i] for i in indices]
+        
+        paths = [s[0] for s in samples]
+        labels = [s[1] for s in samples]
+        return paths, labels
+    
+    def get_all(self):
+        """Retorna todos os exemplos do buffer"""
+        if len(self.buffer) == 0:
+            return [], []
+        paths = [item[0] for item in self.buffer]
+        labels = [item[1] for item in self.buffer]
+        return paths, labels
+    
+    def update_priorities(self, accuracies):
+        """Atualiza prioridades baseado em performance"""
+        # Dar mais prioridade para exemplos difíceis
+        pass  # Implementar se necessário
 
 # ============================================
 # CARREGAMENTO E CONVERSÃO DE IMAGENS
@@ -85,57 +266,44 @@ def load_and_convert_image(image_path, target_mode="RGB"):
         raise
 
 # ============================================
-# DATASET COM AUGMENTATION AVANÇADO
+# DATASET COM MIXUP E AUGMENTATION MELHORADO
 # ============================================
-class ComplexCaptchaDataset(Dataset):
-    def __init__(self, image_paths, labels, processor, mode='train', 
-                 augment_prob=0.85):
+class IncrementalCaptchaDataset(Dataset):
+    """Dataset com suporte para mixup e preservação de conhecimento"""
+    
+    def __init__(self, image_paths, labels, processor, is_old_data=None,
+                 mode='train', augment_prob=0.95, mixup_alpha=0.3, use_mixup=True):
         self.image_paths = image_paths
         self.labels = labels
         self.processor = processor
         self.mode = mode
         self.augment_prob = augment_prob
+        self.mixup_alpha = mixup_alpha
+        self.use_mixup = use_mixup
         
-        if mode == 'train':
-            self._validate_images()
+        # Rastrear origem dos dados
+        if is_old_data is None:
+            self.is_old_data = [False] * len(labels)
+        else:
+            self.is_old_data = is_old_data
     
-    def _validate_images(self):
-        """Valida amostras do dataset"""
-        logger.info("Validando amostras do dataset...")
-        sample_size = min(50, len(self.image_paths))
-        problematic = []
-        
-        for idx in tqdm(range(sample_size), desc="Validando", leave=False):
-            try:
-                img = load_and_convert_image(self.image_paths[idx])
-                img.close()
-            except Exception as e:
-                problematic.append((self.image_paths[idx], str(e)))
-        
-        if problematic:
-            logger.warning(f"⚠️ {len(problematic)} imagens problemáticas em {sample_size} amostras")
-    
-    def augment_image_advanced(self, image):
-        """Augmentation avançado para CAPTCHAs complexos"""
+    def augment_image_conservative(self, image):
+        """Augmentation mais conservador para não distorcer demais"""
         if self.mode != 'train' or random.random() > self.augment_prob:
             return image
         
-        # Distorção elástica (para CAPTCHAs distorcidos)
-        if random.random() < 0.4:
-            image = self.elastic_transform(image)
+        # Aplicar múltiplas augmentations com probabilidades
+        augmentations_applied = []
         
-        # Rotação mais sutil
-        if random.random() < 0.6:
+        # Rotação sutil
+        if random.random() < 0.4:
             angle = random.uniform(-5, 5)
             image = image.rotate(angle, fillcolor=(255, 255, 255), expand=False)
+            augmentations_applied.append('rotation')
         
-        # Perspectiva
-        if random.random() < 0.3:
-            image = self.perspective_transform(image)
-        
-        # Zoom adaptativo
-        if random.random() < 0.5:
-            zoom = random.uniform(0.9, 1.1)
+        # Zoom leve
+        if random.random() < 0.4:
+            zoom = random.uniform(0.92, 1.08)
             w, h = image.size
             new_w, new_h = int(w * zoom), int(h * zoom)
             image = image.resize((new_w, new_h), Image.LANCZOS)
@@ -150,96 +318,106 @@ class ComplexCaptchaDataset(Dataset):
                 top = (h - new_h) // 2
                 new_image.paste(image, (left, top))
                 image = new_image
+            augmentations_applied.append('zoom')
         
-        # Ajustes de cor mais conservadores
-        if random.random() < 0.6:
-            brightness = ImageEnhance.Brightness(image)
-            image = brightness.enhance(random.uniform(0.8, 1.2))
+        # Ajustes de cor
+        if random.random() < 0.5:
+            # Brightness
+            if random.random() < 0.7:
+                brightness = ImageEnhance.Brightness(image)
+                image = brightness.enhance(random.uniform(0.85, 1.15))
             
-            contrast = ImageEnhance.Contrast(image)
-            image = contrast.enhance(random.uniform(0.8, 1.2))
+            # Contrast
+            if random.random() < 0.7:
+                contrast = ImageEnhance.Contrast(image)
+                image = contrast.enhance(random.uniform(0.85, 1.15))
             
+            # Sharpness
             if random.random() < 0.3:
-                saturation = ImageEnhance.Color(image)
-                image = saturation.enhance(random.uniform(0.8, 1.2))
+                sharpness = ImageEnhance.Sharpness(image)
+                image = sharpness.enhance(random.uniform(0.8, 1.2))
+            
+            augmentations_applied.append('color')
         
-        # Blur sutil
-        if random.random() < 0.2:
-            image = image.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.3, 0.8)))
-        
-        # Sharpen ocasional
-        if random.random() < 0.2:
-            sharpness = ImageEnhance.Sharpness(image)
-            image = sharpness.enhance(random.uniform(1.2, 1.5))
-        
-        # Ruído mais controlado
-        if random.random() < 0.4:
+        # Ruído gaussiano leve
+        if random.random() < 0.3:
             pixels = np.array(image)
             noise_std = random.uniform(3, 8)
             noise = np.random.normal(0, noise_std, pixels.shape)
             pixels = np.clip(pixels + noise, 0, 255).astype(np.uint8)
             image = Image.fromarray(pixels)
+            augmentations_applied.append('noise')
+        
+        # Blur muito leve
+        if random.random() < 0.2:
+            image = image.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.1, 0.5)))
+            augmentations_applied.append('blur')
         
         return image
     
-    def elastic_transform(self, image, alpha=20, sigma=3):
-        """Aplica transformação elástica"""
-        img_array = np.array(image)
-        shape = img_array.shape[:2]
+    def apply_mixup(self, image1, image2, label1, label2):
+        """Aplica mixup entre duas imagens"""
+        lam = np.random.beta(self.mixup_alpha, self.mixup_alpha)
         
-        dx = cv2.GaussianBlur((np.random.rand(*shape) * 2 - 1), (0, 0), sigma) * alpha
-        dy = cv2.GaussianBlur((np.random.rand(*shape) * 2 - 1), (0, 0), sigma) * alpha
+        # Garantir que as imagens tenham o mesmo tamanho
+        if image1.size != image2.size:
+            # Redimensionar image2 para o tamanho de image1
+            image2 = image2.resize(image1.size, Image.LANCZOS)
         
-        x, y = np.meshgrid(np.arange(shape[1]), np.arange(shape[0]))
-        x = (x + dx).astype(np.float32)
-        y = (y + dy).astype(np.float32)
+        # Mixup nas imagens
+        mixed_image = Image.blend(image1, image2, 1 - lam)
         
-        transformed = cv2.remap(img_array, x, y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
-        return Image.fromarray(transformed)
-    
-    def perspective_transform(self, image):
-        """Aplica transformação de perspectiva"""
-        img_array = np.array(image)
-        h, w = img_array.shape[:2]
+        # Para seq2seq, usar o label dominante
+        mixed_label = label1 if lam > 0.5 else label2
         
-        # Pontos de origem
-        pts1 = np.float32([[0, 0], [w, 0], [0, h], [w, h]])
-        
-        # Pontos de destino com pequena distorção
-        offset = 10
-        pts2 = np.float32([
-            [random.randint(0, offset), random.randint(0, offset)],
-            [w - random.randint(0, offset), random.randint(0, offset)],
-            [random.randint(0, offset), h - random.randint(0, offset)],
-            [w - random.randint(0, offset), h - random.randint(0, offset)]
-        ])
-        
-        matrix = cv2.getPerspectiveTransform(pts1, pts2)
-        transformed = cv2.warpPerspective(img_array, matrix, (w, h), 
-                                         borderMode=cv2.BORDER_REFLECT)
-        return Image.fromarray(transformed)
+        return mixed_image, mixed_label, lam
     
     def __len__(self):
         return len(self.labels)
     
     def __getitem__(self, idx):
         try:
-            # Carregar imagem sem pré-processamento
+            # Carregar imagem principal
             image = load_and_convert_image(self.image_paths[idx], "RGB")
+            label_text = self.labels[idx].upper()
+            
+            # Aplicar mixup ocasionalmente (20% das vezes no treino)
+            mixup_applied = False
+            if (self.mode == 'train' and self.use_mixup and 
+                random.random() < 0.2 and len(self.image_paths) > 1):
+                
+                try:
+                    # Escolher segunda imagem aleatória
+                    idx2 = random.randint(0, len(self.image_paths) - 1)
+                    while idx2 == idx:
+                        idx2 = random.randint(0, len(self.image_paths) - 1)
+                    
+                    image2 = load_and_convert_image(self.image_paths[idx2], "RGB")
+                    label2_text = self.labels[idx2].upper()
+                    
+                    # Aplicar mixup
+                    image, label_text, lam = self.apply_mixup(
+                        image, image2, label_text, label2_text
+                    )
+                    mixup_applied = True
+                except Exception as e:
+                    # Se mixup falhar, continuar com a imagem original sem mixup
+                    # A imagem NÃO é descartada, apenas não recebe mixup
+                    logger.debug(f"Mixup falhou para {self.image_paths[idx]}, usando imagem original: {e}")
+                    pass
             
             # Aplicar augmentation
             if self.mode == 'train':
-                image = self.augment_image_advanced(image)
+                image = self.augment_image_conservative(image)
             
-            # Processar
+            # Processar imagem
             pixel_values = self.processor(image, return_tensors="pt").pixel_values.squeeze(0)
             
-            # Label
-            label_text = self.labels[idx].upper()
+            # Processar label
             encoding = self.processor.tokenizer(
                 label_text,
                 padding="max_length",
-                max_length=20,  # Aumentado para CAPTCHAs mais longos
+                max_length=20,
                 truncation=True,
                 return_tensors="pt"
             )
@@ -249,93 +427,27 @@ class ComplexCaptchaDataset(Dataset):
             
             return {
                 "pixel_values": pixel_values,
-                "labels": labels
+                "labels": labels,
+                "is_old": self.is_old_data[idx]
             }
             
         except Exception as e:
             logger.error(f"Erro ao processar imagem {self.image_paths[idx]}: {e}")
             next_idx = (idx + 1) % len(self.labels)
-            if next_idx == idx:
-                raise RuntimeError(f"Não foi possível processar nenhuma imagem")
             return self.__getitem__(next_idx)
 
 # ============================================
-# LOSS FUNCTION MELHORADA
+# LOSS FUNCTION COM REGULARIZAÇÃO L2
 # ============================================
-class EnhancedWeightedLoss(nn.Module):
-    def __init__(self, processor, smoothing=0.1, similarity_weight=2.5):
+class IncrementalLoss(nn.Module):
+    def __init__(self, processor, smoothing=0.03, l2_lambda=0.005):
         super().__init__()
         self.processor = processor
         self.smoothing = smoothing
         self.confidence = 1.0 - smoothing
-        self.similarity_weight = similarity_weight
+        self.l2_lambda = l2_lambda
         
-        # Grupos de caracteres similares expandidos
-        self.similar_groups = [
-            # Números vs letras
-            ['0', 'O', 'o', 'Q', 'D'],
-            ['1', 'I', 'l', '|', 'i', 'j'],
-            ['2', 'Z', 'z'],
-            ['3', 'E'],
-            ['4', 'A'],
-            ['5', 'S', 's'],
-            ['6', 'G', 'b', 'd'],
-            ['7', 'T', 'J'],
-            ['8', 'B'],
-            ['9', 'g', 'q', 'p'],
-            
-            # Letras muito similares
-            ['I', 'l', '1', '|', 'i'],
-            ['O', '0', 'o', 'Q', 'D'],
-            ['C', 'c', 'G', '(', '['],
-            ['P', 'p', 'R'],
-            ['U', 'u', 'V', 'v', 'Y'],
-            ['W', 'w', 'M', 'N'],
-            ['n', 'h', 'r', 'm'],
-            ['m', 'rn', 'nn'],
-            ['cl', 'd'],
-            ['ti', 'H'],
-            ['vv', 'w', 'W'],
-            ['rn', 'm'],
-            
-            # Maiúsculas vs minúsculas
-            *[[chr(i), chr(i+32)] for i in range(65, 91)],
-        ]
-        
-        # Criar mapeamento
-        self.similarity_map = {}
-        for group in self.similar_groups:
-            for char1 in group:
-                for char2 in group:
-                    if char1 != char2:
-                        self.similarity_map[(char1, char2)] = True
-        
-        logger.info(f"✓ Loss configurado com {len(self.similarity_map)} pares similares")
-    
-    def get_similarity_weight(self, predicted_text, true_text):
-        """Calcular peso com penalização progressiva"""
-        if len(predicted_text) != len(true_text):
-            return 1.5  # Penalização maior para erros de comprimento
-        
-        total_weight = 0.0
-        error_count = 0
-        
-        for i, (pred_char, true_char) in enumerate(zip(predicted_text, true_text)):
-            if pred_char != true_char:
-                error_count += 1
-                
-                # Peso baseado na posição (erros no início são mais graves)
-                position_weight = 1.0 + (0.2 * (1 - i/len(true_text)))
-                
-                # Verificar similaridade
-                if (pred_char, true_char) in self.similarity_map:
-                    total_weight += self.similarity_weight * position_weight
-                else:
-                    total_weight += 1.0 * position_weight
-        
-        return total_weight / max(error_count, 1)
-    
-    def forward(self, logits, targets, pixel_values=None):
+    def forward(self, logits, targets, old_params=None, new_params=None):
         logits = logits.view(-1, logits.size(-1))
         targets = targets.view(-1)
         
@@ -353,233 +465,347 @@ class EnhancedWeightedLoss(nn.Module):
         
         loss = self.confidence * nll_loss + self.smoothing * smooth_loss
         
-        return loss.mean()
-
-# ============================================
-# LEARNING RATE SCHEDULER CUSTOMIZADO
-# ============================================
-class WarmupCosineScheduler:
-    def __init__(self, optimizer, warmup_steps, total_steps, min_lr=1e-7):
-        self.optimizer = optimizer
-        self.warmup_steps = warmup_steps
-        self.total_steps = total_steps
-        self.min_lr = min_lr
-        self.current_step = 0
-        self.base_lrs = [group['lr'] for group in optimizer.param_groups]
-    
-    def step(self):
-        self.current_step += 1
-        
-        if self.current_step <= self.warmup_steps:
-            # Warmup phase
-            scale = self.current_step / self.warmup_steps
+        # Adicionar regularização L2 se parâmetros antigos fornecidos
+        if old_params is not None and new_params is not None:
+            l2_loss = 0
+            for old_p, new_p in zip(old_params, new_params):
+                l2_loss += ((new_p - old_p) ** 2).sum()
+            loss = loss.mean() + self.l2_lambda * l2_loss
         else:
-            # Cosine annealing
-            progress = (self.current_step - self.warmup_steps) / (self.total_steps - self.warmup_steps)
-            scale = 0.5 * (1 + np.cos(np.pi * progress))
+            loss = loss.mean()
         
-        for idx, group in enumerate(self.optimizer.param_groups):
-            base_lr = self.base_lrs[idx]
-            new_lr = self.min_lr + (base_lr - self.min_lr) * scale
-            group['lr'] = new_lr
-    
-    def get_lr(self):
-        return [group['lr'] for group in self.optimizer.param_groups]
+        return loss
 
 # ============================================
-# FUNÇÃO PRINCIPAL DE RE-TREINO
+# GRADIENT CLIPPING ADAPTATIVO
 # ============================================
-def retrain_complex_captcha():
+def adaptive_gradient_clipping(model, epoch, max_norm=1.0):
+    """Clipping adaptativo baseado na época"""
+    # Adaptar max_norm baseado na época
+    if epoch < 10:
+        adaptive_max_norm = max_norm * 2.0  # Mais permissivo no início
+    elif epoch < 30:
+        adaptive_max_norm = max_norm * 1.5
+    elif epoch < 50:
+        adaptive_max_norm = max_norm * 1.2
+    else:
+        adaptive_max_norm = max_norm
+    
+    total_norm = torch.nn.utils.clip_grad_norm_(
+        model.parameters(), 
+        adaptive_max_norm
+    )
+    
+    # Converter para float se for tensor
+    if isinstance(total_norm, torch.Tensor):
+        total_norm = total_norm.item()
+    
+    return total_norm, adaptive_max_norm
+
+# ============================================
+# FUNÇÃO PRINCIPAL DE TREINO INCREMENTAL
+# ============================================
+def incremental_training():
     # Configurar serialização
     setup_torch_serialization()
     
-    # ====== CONFIGURAÇÕES AJUSTADAS PARA RE-TREINO ======
-    BASE_MODEL_PATH = "./best_model"  # Modelo base treinado
-    CAPTCHA_FOLDER = "./trocr-camada-3"      # Nova base complexa
-    OUTPUT_DIR = "./trocr-camada-1.2"          # Novo diretório de saída
+    # ====== CONFIGURAÇÕES OTIMIZADAS PARA MÁXIMO APRENDIZADO ======
+    BASE_MODEL_PATH = "./trocr-incremental-9/best_model"   # Modelo base treinado
+    OLD_DATASET_PATH = "./img_base_captcha"                    # Dataset original (para replay)
+    NEW_DATASET_PATH = "./captcha-full"                # Novo dataset complexo
+    OUTPUT_DIR = "./trocr-incremental-12"                  # Diretório de saída
     
-   # Hiperparâmetros ultra-agressivos para fine-tuning em dataset pequeno
-
-    BATCH_SIZE = 4                      # Batch físico pequeno para overfitting controlado
-    GRADIENT_ACCUMULATION = 16          # Simula batch virtual gigante para estabilidade
-    LEARNING_RATE = 5e-5                # Alto para aprender rápido
-    MIN_LR = 1e-8
-    WEIGHT_DECAY = 0.002                # Quase sem restrição
+    # Hiperparâmetros otimizados
+    BATCH_SIZE = 4                          # Aumentado de 1 para 4
+    GRADIENT_ACCUMULATION = 16              # Reduzido de 64 para 16
+    LEARNING_RATE = 2.5e-4                  # Aumentado para aprendizado mais agressivo
+    MIN_LR = 5e-7
+    WEIGHT_DECAY = 0.005                    # Reduzido para permitir mais adaptação
     
-    NUM_EPOCHS = 200                    # Muitas épocas para explorar
-    PATIENCE = 60                       # Early stopping bem tolerante
-    WARMUP_RATIO = 0.3                  # Warmup longo para não explodir no início
+    NUM_EPOCHS = 100                        # Aumentado para garantir convergência
+    PATIENCE = 20                           # Aumentado para dar mais chance
+    WARMUP_STEPS = 500                      # Warmup em steps ao invés de ratio
     
-    LABEL_SMOOTHING = 0.2               # Muito smoothing para não decorar
-    DROPOUT = 0.5                       # Dropout muito forte
-    AUGMENT_PROB = 1.0                  # Sempre aplica augmentation
-    SIMILARITY_WEIGHT = 6.0          # Penaliza fortemente erros parecidos
+    # Parâmetros de preservação de conhecimento otimizados
+    USE_EWC = True                          # Elastic Weight Consolidation
+    EWC_LAMBDA = 0.4                        # Reduzido para ser menos conservador
+    FISHER_SAMPLES = 1000                   # Aumentado para melhor estimativa
     
-    # Otimização
-    GRADIENT_ACCUMULATION = 8      # Mais acumulação para simular batch maior e estabilizar
-
+    USE_DISTILLATION = True                 # Knowledge Distillation
+    DISTILLATION_ALPHA = 0.5               # 45% preservação, 55% novo
+    DISTILLATION_TEMPERATURE = 6.0          # Aumentado para mais softening
+    
+    USE_REPLAY = True                       # Experience Replay
+    REPLAY_RATIO = 0.35                     # 35% dados antigos, 65% dados novos
+    REPLAY_BUFFER_SIZE = 3000               # Buffer aumentado
+    
+    # Regularização e augmentation
+    LABEL_SMOOTHING = 0.03                  # Aumentado para melhor generalização
+    AUGMENT_PROB = 0.95                     # Augmentation muito agressivo
+    USE_MIXUP = True                        # Ativar mixup
+    MIXUP_ALPHA = 0.3                       # Alpha para mixup
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     logger.info("="*70)
-    logger.info("RE-TREINO PARA CAPTCHAS COMPLEXOS - CAMADA 2")
+    logger.info("🚀 TREINAMENTO INCREMENTAL OTIMIZADO - MÁXIMO APRENDIZADO")
     logger.info("="*70)
-    logger.info(f"🔧 Device: {device}")
-    logger.info(f"📂 Modelo base: {BASE_MODEL_PATH}")
-    logger.info(f"📂 Dataset: {CAPTCHA_FOLDER}")
-    logger.info(f"📂 Output: {OUTPUT_DIR}")
-    logger.info(f"⚙️ Batch size: {BATCH_SIZE} (x{GRADIENT_ACCUMULATION} accumulation)")
-    logger.info(f"⚙️ Learning rate: {LEARNING_RATE} → {MIN_LR}")
-    logger.info(f"⚙️ Epochs: {NUM_EPOCHS}")
-    logger.info(f"⚙️ Augmentation: {AUGMENT_PROB*100:.0f}%")
+    logger.info(f"📍 Device: {device}")
+    logger.info(f"📁 Modelo base: {BASE_MODEL_PATH}")
+    logger.info(f"📁 Dataset antigo: {OLD_DATASET_PATH}")
+    logger.info(f"📁 Dataset novo: {NEW_DATASET_PATH}")
+    logger.info(f"📁 Output: {OUTPUT_DIR}")
+    logger.info(f"⚙️  Effective Batch Size: {BATCH_SIZE * GRADIENT_ACCUMULATION}")
+    logger.info(f"📈 Learning rate: {LEARNING_RATE}")
+    logger.info(f"🔧 EWC: {USE_EWC} (λ={EWC_LAMBDA}, samples={FISHER_SAMPLES})")
+    logger.info(f"🔧 Distillation: {USE_DISTILLATION} (α={DISTILLATION_ALPHA}, T={DISTILLATION_TEMPERATURE})")
+    logger.info(f"🔧 Replay: {USE_REPLAY} (ratio={REPLAY_RATIO}, buffer={REPLAY_BUFFER_SIZE})")
+    logger.info(f"🔧 Mixup: {USE_MIXUP} (α={MIXUP_ALPHA})")
     
-    # Criar diretório de saída
+    # Criar diretórios
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     os.makedirs(os.path.join(OUTPUT_DIR, "checkpoints"), exist_ok=True)
     
-    # ====== CARREGAR MODELO BASE ======
+    # ====== CARREGAR MODELO BASE E CRIAR CÓPIA PARA TEACHER ======
     logger.info("\n" + "="*70)
-    logger.info("CARREGANDO MODELO BASE TREINADO")
+    logger.info("📚 CARREGANDO MODELOS")
     logger.info("="*70)
     
     try:
         processor = TrOCRProcessor.from_pretrained(BASE_MODEL_PATH)
-        model = VisionEncoderDecoderModel.from_pretrained(BASE_MODEL_PATH)
-        logger.info("✅ Modelo base carregado com sucesso")
+        student_model = VisionEncoderDecoderModel.from_pretrained(BASE_MODEL_PATH)
+        logger.info("✓ Modelo base carregado com sucesso")
+        
+        # Criar modelo teacher (frozen)
+        if USE_DISTILLATION:
+            teacher_model = VisionEncoderDecoderModel.from_pretrained(BASE_MODEL_PATH)
+            teacher_model.to(device)
+            teacher_model.eval()
+            for param in teacher_model.parameters():
+                param.requires_grad = False
+            logger.info("✓ Modelo teacher criado e congelado")
+        else:
+            teacher_model = None
+            
     except Exception as e:
         logger.error(f"❌ Erro ao carregar modelo base: {e}")
-        logger.info("Carregando modelo padrão do HuggingFace...")
-        processor = TrOCRProcessor.from_pretrained("microsoft/trocr-base-str")
-        model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-base-str")
-    
-    # Configurar model
-    model.config.use_cache = True
-    model.config.decoder_start_token_id = processor.tokenizer.cls_token_id or processor.tokenizer.bos_token_id
-    model.config.pad_token_id = processor.tokenizer.pad_token_id
-    
-    # Configurar dropout
-    if hasattr(model.decoder, 'model') and hasattr(model.decoder.model, 'decoder'):
-        for layer in model.decoder.model.decoder.layers:
-            layer.dropout = DROPOUT
-            if hasattr(layer, 'self_attn'):
-                layer.self_attn.dropout = DROPOUT
-            if hasattr(layer, 'encoder_attn'):
-                layer.encoder_attn.dropout = DROPOUT
-    
-    model.to(device)
-    model.gradient_checkpointing_enable()
-    
-    # ====== CARREGAR DATASET ======
-    logger.info("\n" + "="*70)
-    logger.info("CARREGANDO DATASET COMPLEXO")
-    logger.info("="*70)
-    
-    image_paths = []
-    labels = []
-    file_stats = {'total': 0, 'valid': 0, 'invalid': 0}
-    
-    for filename in os.listdir(CAPTCHA_FOLDER):
-        if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff')):
-            file_stats['total'] += 1
-            image_path = os.path.join(CAPTCHA_FOLDER, filename)
-            label = os.path.splitext(filename)[0]
-            
-            # Validação mais flexível para CAPTCHAs complexos
-            if 1 <= len(label) <= 25:  # Permitir labels mais longos
-                try:
-                    # Teste de carregamento
-                    test_img = load_and_convert_image(image_path, "RGB")
-                    test_img.close()
-                    
-                    image_paths.append(image_path)
-                    labels.append(label)
-                    file_stats['valid'] += 1
-                except Exception as e:
-                    file_stats['invalid'] += 1
-                    if file_stats['invalid'] <= 5:
-                        logger.warning(f"Imagem inválida: {filename} - {e}")
-            else:
-                file_stats['invalid'] += 1
-    
-    logger.info(f"📊 Estatísticas do dataset:")
-    logger.info(f"   Total de arquivos: {file_stats['total']}")
-    logger.info(f"   Válidos: {file_stats['valid']}")
-    logger.info(f"   Inválidos: {file_stats['invalid']}")
-    
-    if len(image_paths) == 0:
-        logger.error("❌ Nenhuma imagem válida encontrada!")
         return
     
+    # Configurar student model
+    student_model.config.use_cache = True
+    student_model.to(device)
+    
+    # ====== CARREGAR DATASETS ======
+    logger.info("\n" + "="*70)
+    logger.info("📊 CARREGANDO DATASETS")
+    logger.info("="*70)
+    
+    # Carregar dataset antigo para replay
+    old_image_paths = []
+    old_labels = []
+    
+    if USE_REPLAY and os.path.exists(OLD_DATASET_PATH):
+        for filename in os.listdir(OLD_DATASET_PATH):
+            if filename.lower().endswith(('.png', '.jpg', '.jpeg')):
+                image_path = os.path.join(OLD_DATASET_PATH, filename)
+                label = os.path.splitext(filename)[0]
+                if 3 <= len(label) <= 10:
+                    old_image_paths.append(image_path)
+                    old_labels.append(label)
+        
+        logger.info(f"📂 Dataset antigo: {len(old_image_paths)} imagens")
+    
+    # Carregar novo dataset
+    new_image_paths = []
+    new_labels = []
+    
+    for filename in os.listdir(NEW_DATASET_PATH):
+        if filename.lower().endswith(('.png', '.jpg', '.jpeg')):
+            image_path = os.path.join(NEW_DATASET_PATH, filename)
+            label = os.path.splitext(filename)[0]
+            if 1 <= len(label) <= 25:
+                new_image_paths.append(image_path)
+                new_labels.append(label)
+    
+    logger.info(f"📂 Dataset novo: {len(new_image_paths)} imagens")
+    
+    # Criar replay buffer
+    replay_buffer = ReplayBuffer(REPLAY_BUFFER_SIZE)
+    
+    # Adicionar amostras antigas ao buffer com prioridade
+    if USE_REPLAY and len(old_image_paths) > 0:
+        # Calcular quantidade de exemplos antigos
+        n_old_samples = min(len(old_image_paths), int(len(new_image_paths) * REPLAY_RATIO))
+        
+        # Amostrar com estratificação se possível
+        old_indices = random.sample(range(len(old_image_paths)), n_old_samples)
+        
+        for idx in old_indices:
+            # Dar prioridade maior para exemplos mais difíceis
+            priority = random.uniform(0.8, 1.2)
+            replay_buffer.add(old_image_paths[idx], old_labels[idx], priority)
+        
+        logger.info(f"💾 Replay buffer: {len(replay_buffer.buffer)} exemplos antigos")
+    
+    # Combinar datasets e rastrear origem
+    if USE_REPLAY and len(replay_buffer.buffer) > 0:
+        replay_paths, replay_labels = replay_buffer.get_all()
+        
+        combined_paths = new_image_paths + replay_paths
+        combined_labels = new_labels + replay_labels
+        
+        # Rastrear origem dos dados
+        is_old_data = [False] * len(new_image_paths) + [True] * len(replay_paths)
+        
+        logger.info(f"📊 Dataset combinado: {len(combined_paths)} imagens total")
+        logger.info(f"   → {len(new_image_paths)} novas ({(len(new_image_paths)/len(combined_paths)*100):.1f}%)")
+        logger.info(f"   → {len(replay_paths)} antigas ({(len(replay_paths)/len(combined_paths)*100):.1f}%)")
+    else:
+        combined_paths = new_image_paths
+        combined_labels = new_labels
+        is_old_data = [False] * len(combined_paths)
+    
     # Adicionar novos tokens se necessário
-    all_chars = set(''.join(labels))
+    all_chars = set(''.join(combined_labels))
     vocab = processor.tokenizer.get_vocab()
     new_tokens = [c for c in all_chars if c not in vocab]
     
     if new_tokens:
         processor.tokenizer.add_tokens(new_tokens)
-        model.decoder.resize_token_embeddings(len(processor.tokenizer))
-        logger.info(f"✅ Adicionados {len(new_tokens)} novos tokens ao vocabulário")
+        student_model.decoder.resize_token_embeddings(len(processor.tokenizer))
+        if teacher_model:
+            teacher_model.decoder.resize_token_embeddings(len(processor.tokenizer))
+        logger.info(f"✓ Adicionados {len(new_tokens)} novos tokens: {new_tokens}")
     
-    # Split do dataset
-    train_paths, val_paths, train_labels, val_labels = train_test_split(
-        image_paths, labels, test_size=0.15, random_state=42
+    # Split do dataset mantendo 15% para validação
+    train_paths, val_paths, train_labels, val_labels, train_is_old, val_is_old = train_test_split(
+        combined_paths, combined_labels, is_old_data,
+        test_size=0.15,  # 15% para validação conforme solicitado
+        random_state=42
     )
     
-    logger.info(f"📊 Split do dataset:")
-    logger.info(f"   Treino: {len(train_paths)} imagens")
-    logger.info(f"   Validação: {len(val_paths)} imagens")
+    logger.info(f"\n📊 Split final:")
+    logger.info(f"   → Treino: {len(train_paths)} imagens (85%)")
+    logger.info(f"   → Validação: {len(val_paths)} imagens (15%)")
+    
+    # ====== CALCULAR EWC SE NECESSÁRIO ======
+    ewc = None
+    if USE_EWC and len(old_image_paths) > 0:
+        logger.info("\n⚖️ Calculando Fisher Information Matrix para EWC...")
+        
+        # Usar mais amostras para melhor estimativa
+        n_fisher_samples = min(FISHER_SAMPLES, len(old_image_paths))
+        fisher_indices = random.sample(range(len(old_image_paths)), n_fisher_samples)
+        
+        ewc_paths = [old_image_paths[i] for i in fisher_indices]
+        ewc_labels = [old_labels[i] for i in fisher_indices]
+        
+        ewc_dataset = IncrementalCaptchaDataset(
+            ewc_paths, ewc_labels, processor, 
+            is_old_data=[True] * len(ewc_paths),
+            mode='val', augment_prob=0
+        )
+        
+        ewc_loader = DataLoader(
+            ewc_dataset, 
+            batch_size=BATCH_SIZE * 2,  # Batch maior para Fisher
+            shuffle=False,
+            num_workers=0
+        )
+        
+        ewc = EWC(student_model, ewc_loader, device, fisher_estimation_sample_size=n_fisher_samples)
+        logger.info(f"✓ EWC configurado com {n_fisher_samples} amostras")
     
     # ====== CRIAR DATASETS E DATALOADERS ======
-    train_dataset = ComplexCaptchaDataset(
+    train_dataset = IncrementalCaptchaDataset(
         train_paths, train_labels, processor,
-        mode='train', augment_prob=AUGMENT_PROB
+        is_old_data=train_is_old,
+        mode='train', 
+        augment_prob=AUGMENT_PROB,
+        mixup_alpha=MIXUP_ALPHA,
+        use_mixup=USE_MIXUP
     )
     
-    val_dataset = ComplexCaptchaDataset(
+    val_dataset = IncrementalCaptchaDataset(
         val_paths, val_labels, processor,
-        mode='val', augment_prob=0
+        is_old_data=val_is_old,
+        mode='val', 
+        augment_prob=0,
+        use_mixup=False
     )
     
     train_loader = DataLoader(
-        train_dataset, batch_size=BATCH_SIZE,
-        shuffle=True, num_workers=0, drop_last=True
+        train_dataset, 
+        batch_size=BATCH_SIZE,
+        shuffle=True, 
+        num_workers=0, 
+        drop_last=True,
+        pin_memory=True
     )
     
     val_loader = DataLoader(
-        val_dataset, batch_size=BATCH_SIZE * 2,
-        shuffle=False, num_workers=0
+        val_dataset, 
+        batch_size=BATCH_SIZE * 2,
+        shuffle=False, 
+        num_workers=0,
+        pin_memory=True
     )
     
     # ====== CONFIGURAR OTIMIZAÇÃO ======
-    # Usar diferentes learning rates para encoder e decoder
+    # Diferentes learning rates para diferentes partes do modelo
     encoder_params = []
-    decoder_params = []
+    decoder_embed_params = []
+    decoder_layer_params = []
     
-    for name, param in model.named_parameters():
+    for name, param in student_model.named_parameters():
         if 'encoder' in name:
             encoder_params.append(param)
+        elif 'decoder' in name and 'embed' in name:
+            decoder_embed_params.append(param)
         else:
-            decoder_params.append(param)
+            decoder_layer_params.append(param)
     
     optimizer = torch.optim.AdamW([
-        {'params': encoder_params, 'lr': LEARNING_RATE * 0.1},  # LR menor para encoder
-        {'params': decoder_params, 'lr': LEARNING_RATE}
-    ], weight_decay=WEIGHT_DECAY)
+        {'params': encoder_params, 'lr': LEARNING_RATE * 0.1, 'weight_decay': WEIGHT_DECAY * 2},
+        {'params': decoder_embed_params, 'lr': LEARNING_RATE * 0.5, 'weight_decay': WEIGHT_DECAY},
+        {'params': decoder_layer_params, 'lr': LEARNING_RATE, 'weight_decay': WEIGHT_DECAY * 0.5}
+    ], betas=(0.9, 0.999), eps=1e-8)
     
-    # Scheduler
-    total_steps = len(train_loader) * NUM_EPOCHS // GRADIENT_ACCUMULATION
-    warmup_steps = int(total_steps * WARMUP_RATIO)
-    scheduler = WarmupCosineScheduler(optimizer, warmup_steps, total_steps, MIN_LR)
+    # Calcular total de steps para scheduler
+    total_training_steps = len(train_loader) * NUM_EPOCHS
     
-    # Loss function
-    criterion = EnhancedWeightedLoss(processor, LABEL_SMOOTHING, SIMILARITY_WEIGHT)
+    # Learning rate scheduler
+    scheduler = OneCycleLR(
+        optimizer,
+        max_lr=[LEARNING_RATE * 0.1, LEARNING_RATE * 0.5, LEARNING_RATE],
+        total_steps=total_training_steps,
+        pct_start=0.05,  # 5% warmup
+        anneal_strategy='cos',
+        cycle_momentum=False,
+        div_factor=25.0,
+        final_div_factor=1000.0
+    )
+    
+    # Loss functions
+    base_criterion = IncrementalLoss(processor, LABEL_SMOOTHING, l2_lambda=WEIGHT_DECAY)
+    
+    if USE_DISTILLATION:
+        kd_criterion = KnowledgeDistillationLoss(
+            temperature=DISTILLATION_TEMPERATURE,
+            alpha=DISTILLATION_ALPHA
+        )
+    
+    # Metrics tracker
+    metrics_tracker = MetricsTracker()
     
     # ====== TREINAMENTO ======
     logger.info("\n" + "="*70)
-    logger.info("INICIANDO RE-TREINO")
+    logger.info("🎯 INICIANDO TREINAMENTO INCREMENTAL OTIMIZADO")
     logger.info("="*70)
     
     best_accuracy = 0
+    best_old_accuracy = 0
+    best_new_accuracy = 0
     patience_counter = 0
     train_losses = []
     val_losses = []
@@ -589,9 +815,11 @@ def retrain_complex_captcha():
         epoch_start = time.time()
         
         # ====== FASE DE TREINO ======
-        model.train()
+        student_model.train()
         train_loss = 0
-        accumulation_counter = 0
+        ewc_loss_total = 0
+        kd_loss_total = 0
+        grad_norms = []
         
         train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} - Training")
         
@@ -599,44 +827,73 @@ def retrain_complex_captcha():
             pixel_values = batch['pixel_values'].to(device)
             labels = batch['labels'].to(device)
             
-            # Forward
-            outputs = model(pixel_values=pixel_values, labels=labels)
-            loss = criterion(outputs.logits, labels, pixel_values)
+            # Forward no student
+            outputs = student_model(pixel_values=pixel_values, labels=labels)
             
-            # Normalizar loss pela acumulação de gradiente
+            # Loss base
+            loss = base_criterion(outputs.logits, labels)
+            
+            # Knowledge Distillation
+            if USE_DISTILLATION and teacher_model is not None:
+                with torch.no_grad():
+                    teacher_outputs = teacher_model(pixel_values=pixel_values, labels=labels)
+                
+                kd_loss, hard_loss, soft_loss = kd_criterion(
+                    outputs.logits, teacher_outputs.logits, labels, base_criterion
+                )
+                loss = kd_loss
+                kd_loss_total += soft_loss.item()
+            
+            # EWC penalty
+            if USE_EWC and ewc is not None:
+                ewc_penalty = ewc.penalty(student_model)
+                loss = loss + EWC_LAMBDA * ewc_penalty
+                ewc_loss_total += ewc_penalty.item()
+            
+            # Backward com gradient accumulation
             loss = loss / GRADIENT_ACCUMULATION
             loss.backward()
             
-            accumulation_counter += 1
-            
-            # Atualizar pesos após acumulação
-            if accumulation_counter % GRADIENT_ACCUMULATION == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            # Update weights a cada GRADIENT_ACCUMULATION steps
+            if (batch_idx + 1) % GRADIENT_ACCUMULATION == 0:
+                # Gradient clipping adaptativo
+                grad_norm, max_norm = adaptive_gradient_clipping(student_model, epoch)
+                grad_norms.append(grad_norm)
+                
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
             
             train_loss += loss.item() * GRADIENT_ACCUMULATION
             
-            # Atualizar progress bar
-            current_lr = scheduler.get_lr()[0]
-            train_pbar.set_postfix({
+            # Update progress bar
+            current_lr = scheduler.get_last_lr()[0]
+            postfix = {
                 'loss': f'{loss.item()*GRADIENT_ACCUMULATION:.4f}',
-                'avg_loss': f'{train_loss/(batch_idx+1):.4f}',
                 'lr': f'{current_lr:.2e}'
-            })
+            }
+            if USE_EWC and ewc_loss_total > 0:
+                postfix['ewc'] = f'{ewc_loss_total/(batch_idx+1):.4f}'
+            if USE_DISTILLATION and kd_loss_total > 0:
+                postfix['kd'] = f'{kd_loss_total/(batch_idx+1):.4f}'
+            if grad_norms:
+                # Garantir que grad_norms são valores float, não tensors
+                grad_norms_values = [g.item() if isinstance(g, torch.Tensor) else g for g in grad_norms]
+                postfix['grad'] = f'{np.mean(grad_norms_values):.2f}'
+            train_pbar.set_postfix(postfix)
         
         train_pbar.close()
         avg_train_loss = train_loss / len(train_loader)
         train_losses.append(avg_train_loss)
         
         # ====== FASE DE VALIDAÇÃO ======
-        model.eval()
+        student_model.eval()
         val_loss = 0
         correct = 0
         total = 0
-        char_correct = 0
-        char_total = 0
+        
+        # Resetar tracker de métricas
+        metrics_tracker.reset()
         
         val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} - Validation")
         
@@ -644,19 +901,20 @@ def retrain_complex_captcha():
             for batch in val_pbar:
                 pixel_values = batch['pixel_values'].to(device)
                 labels = batch['labels'].to(device)
+                is_old = batch['is_old']
                 
-                # Loss
-                outputs = model(pixel_values=pixel_values, labels=labels)
-                loss = criterion(outputs.logits, labels, pixel_values)
+                # Forward
+                outputs = student_model(pixel_values=pixel_values, labels=labels)
+                loss = base_criterion(outputs.logits, labels)
                 val_loss += loss.item()
                 
-                # Generate
-                generated_ids = model.generate(
+                # Generate predictions
+                generated_ids = student_model.generate(
                     pixel_values,
                     max_new_tokens=20,
-                    num_beams=5,
-                    length_penalty=0.8,
-                    early_stopping=True
+                    num_beams=3,
+                    early_stopping=True,
+                    no_repeat_ngram_size=2
                 )
                 
                 # Decode
@@ -666,8 +924,8 @@ def retrain_complex_captcha():
                 labels_clean[labels_clean == -100] = processor.tokenizer.pad_token_id
                 true_texts = processor.batch_decode(labels_clean, skip_special_tokens=True)
                 
-                # Calculate accuracies
-                for pred, true in zip(pred_texts, true_texts):
+                # Calculate accuracies com tracking
+                for pred, true, old in zip(pred_texts, true_texts, is_old):
                     pred = pred.strip().upper()
                     true = true.strip().upper()
                     
@@ -675,29 +933,22 @@ def retrain_complex_captcha():
                     if pred == true:
                         correct += 1
                     
-                    # Character-level accuracy
-                    for p_char, t_char in zip(pred, true):
-                        char_total += 1
-                        if p_char == t_char:
-                            char_correct += 1
-                    char_total += abs(len(pred) - len(true))  # Penalizar diferença de tamanho
+                    # Atualizar métricas separadas
+                    metrics_tracker.update(pred, true, old.item(), loss.item())
                 
-                # Atualizar progress bar
                 current_acc = correct / total if total > 0 else 0
-                char_acc = char_correct / char_total if char_total > 0 else 0
-                val_pbar.set_postfix({
-                    'loss': f'{loss.item():.4f}',
-                    'acc': f'{current_acc:.2%}',
-                    'char_acc': f'{char_acc:.2%}'
-                })
+                val_pbar.set_postfix({'acc': f'{current_acc:.2%}'})
         
         val_pbar.close()
         
         avg_val_loss = val_loss / len(val_loader)
         val_losses.append(avg_val_loss)
         
+        # Obter métricas separadas
+        metrics = metrics_tracker.get_accuracies()
         accuracy = correct / total
-        char_accuracy = char_correct / char_total if char_total > 0 else 0
+        old_accuracy = metrics.get('old_data_acc', 0)
+        new_accuracy = metrics.get('new_data_acc', 0)
         accuracies.append(accuracy)
         
         epoch_time = time.time() - epoch_start
@@ -706,124 +957,145 @@ def retrain_complex_captcha():
         logger.info(f"\n{'='*70}")
         logger.info(f"📊 Epoch {epoch+1}/{NUM_EPOCHS} ({epoch_time:.1f}s)")
         logger.info(f"📉 Loss - Train: {avg_train_loss:.4f}, Val: {avg_val_loss:.4f}")
-        logger.info(f"📈 Accuracy - Full: {accuracy:.2%}, Character: {char_accuracy:.2%}")
-        logger.info(f"🔧 Learning Rate: {scheduler.get_lr()[0]:.2e}")
+        logger.info(f"🎯 Accuracy Total: {accuracy:.2%}")
+        logger.info(f"   └─ Dados Antigos: {old_accuracy:.2%}")
+        logger.info(f"   └─ Dados Novos: {new_accuracy:.2%}")
+        logger.info(f"📈 Learning Rate: {scheduler.get_last_lr()[0]:.2e}")
+        
+        if USE_EWC and ewc_loss_total > 0:
+            logger.info(f"⚖️ EWC Penalty médio: {ewc_loss_total/len(train_loader):.4f}")
+        if USE_DISTILLATION and kd_loss_total > 0:
+            logger.info(f"🔄 KD Loss médio: {kd_loss_total/len(train_loader):.4f}")
+        if grad_norms:
+            grad_norms_values = [g.item() if isinstance(g, torch.Tensor) else g for g in grad_norms]
+            logger.info(f"📊 Gradient Norm médio: {np.mean(grad_norms_values):.2f}")
         
         # ====== SALVAR CHECKPOINT ======
-        if (epoch + 1) % 5 == 0 or accuracy > best_accuracy:
-            checkpoint_path = os.path.join(OUTPUT_DIR, "checkpoints", f"checkpoint_epoch_{epoch+1}")
-            model.save_pretrained(checkpoint_path)
-            processor.save_pretrained(checkpoint_path)
-            
-            # Salvar métricas
-            metrics = {
-                'epoch': epoch + 1,
-                'accuracy': accuracy,
-                'char_accuracy': char_accuracy,
-                'train_loss': avg_train_loss,
-                'val_loss': avg_val_loss,
-                'learning_rate': scheduler.get_lr()[0]
-            }
-            
-            with open(os.path.join(checkpoint_path, "metrics.json"), 'w') as f:
-                json.dump(metrics, f, indent=2)
-            
-            logger.info(f"💾 Checkpoint salvo: {checkpoint_path}")
-        
-        # ====== SALVAR MELHOR MODELO ======
         if accuracy > best_accuracy:
             best_accuracy = accuracy
+            best_old_accuracy = old_accuracy
+            best_new_accuracy = new_accuracy
             patience_counter = 0
             
             best_model_path = os.path.join(OUTPUT_DIR, "best_model")
-            model.save_pretrained(best_model_path)
+            student_model.save_pretrained(best_model_path)
             processor.save_pretrained(best_model_path)
             
-            logger.info(f"🏆 Novo melhor modelo: {best_accuracy:.2%}")
+            # Salvar métricas detalhadas
+            metrics_dict = {
+                'epoch': epoch + 1,
+                'accuracy_total': accuracy,
+                'accuracy_old': old_accuracy,
+                'accuracy_new': new_accuracy,
+                'train_loss': avg_train_loss,
+                'val_loss': avg_val_loss,
+                'learning_rate': scheduler.get_last_lr()[0],
+                'config': {
+                    'batch_size': BATCH_SIZE,
+                    'gradient_accumulation': GRADIENT_ACCUMULATION,
+                    'effective_batch_size': BATCH_SIZE * GRADIENT_ACCUMULATION,
+                    'learning_rate': LEARNING_RATE,
+                    'weight_decay': WEIGHT_DECAY,
+                    'use_ewc': USE_EWC,
+                    'ewc_lambda': EWC_LAMBDA if USE_EWC else None,
+                    'fisher_samples': FISHER_SAMPLES if USE_EWC else None,
+                    'use_distillation': USE_DISTILLATION,
+                    'distillation_alpha': DISTILLATION_ALPHA if USE_DISTILLATION else None,
+                    'distillation_temperature': DISTILLATION_TEMPERATURE if USE_DISTILLATION else None,
+                    'use_replay': USE_REPLAY,
+                    'replay_ratio': REPLAY_RATIO if USE_REPLAY else None,
+                    'replay_buffer_size': REPLAY_BUFFER_SIZE if USE_REPLAY else None,
+                    'use_mixup': USE_MIXUP,
+                    'mixup_alpha': MIXUP_ALPHA if USE_MIXUP else None,
+                    'label_smoothing': LABEL_SMOOTHING,
+                    'augment_prob': AUGMENT_PROB
+                }
+            }
+            
+            with open(os.path.join(best_model_path, "metrics.json"), 'w') as f:
+                json.dump(metrics_dict, f, indent=2)
+            
+            logger.info(f"🏆 Novo melhor modelo salvo: {best_accuracy:.2%}")
         else:
             patience_counter += 1
             if patience_counter >= PATIENCE:
-                logger.info(f"\n⏹️ Early stopping após {PATIENCE} epochs sem melhoria")
+                logger.info(f"\n⛔ Early stopping após {PATIENCE} epochs sem melhoria")
                 break
         
-        # ====== EXEMPLOS DE PREDIÇÃO ======
-        if (epoch + 1) % 10 == 0 or accuracy > best_accuracy - 0.01:
-            logger.info("\n📝 Exemplos de predições:")
-            model.eval()
-            with torch.no_grad():
-                for i in range(min(5, len(val_dataset))):
-                    item = val_dataset[i]
-                    pixel_values = item['pixel_values'].unsqueeze(0).to(device)
-                    
-                    generated_ids = model.generate(
-                        pixel_values, 
-                        max_new_tokens=20,
-                        num_beams=5
-                    )
-                    
-                    pred_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-                    true_text = val_labels[i]
-                    
-                    status = "✅" if pred_text.upper() == true_text.upper() else "❌"
-                    logger.info(f"  {status} True: '{true_text}' → Pred: '{pred_text}'")
+        # Salvar checkpoint periódico
+        if (epoch + 1) % 10 == 0:
+            checkpoint_path = os.path.join(OUTPUT_DIR, "checkpoints", f"checkpoint_epoch_{epoch+1}.pt")
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': student_model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'best_accuracy': best_accuracy,
+                'train_losses': train_losses,
+                'val_losses': val_losses,
+                'accuracies': accuracies
+            }, checkpoint_path)
+            logger.info(f"💾 Checkpoint salvo: {checkpoint_path}")
     
     # ====== ANÁLISE FINAL ======
     logger.info("\n" + "="*70)
-    logger.info("🎯 RE-TREINO COMPLETO!")
+    logger.info("🎉 TREINAMENTO INCREMENTAL COMPLETO!")
     logger.info("="*70)
-    logger.info(f"📊 Melhor acurácia: {best_accuracy:.2%}")
-    logger.info(f"📂 Melhor modelo salvo em: {os.path.join(OUTPUT_DIR, 'best_model')}")
+    logger.info(f"🏆 Melhor acurácia total: {best_accuracy:.2%}")
+    logger.info(f"   └─ Em dados antigos: {best_old_accuracy:.2%}")
+    logger.info(f"   └─ Em dados novos: {best_new_accuracy:.2%}")
+    logger.info(f"📁 Modelo salvo em: {os.path.join(OUTPUT_DIR, 'best_model')}")
     
-    # Salvar histórico de treinamento
-    history = {
-        'train_losses': train_losses,
-        'val_losses': val_losses,
-        'accuracies': accuracies,
+    # Análise de catastrophic forgetting
+    if best_old_accuracy > 0 and best_new_accuracy > 0:
+        logger.info(f"\n📊 Análise de Preservação de Conhecimento:")
+        
+        preservation_score = best_old_accuracy
+        adaptation_score = best_new_accuracy
+        overall_score = (preservation_score + adaptation_score) / 2
+        
+        logger.info(f"   Preservação: {preservation_score:.2%}")
+        logger.info(f"   Adaptação: {adaptation_score:.2%}")
+        logger.info(f"   Score geral: {overall_score:.2%}")
+        
+        if preservation_score > 0.75:
+            logger.info("   ✅ Excelente preservação do conhecimento anterior!")
+        elif preservation_score > 0.60:
+            logger.info("   ⚠️ Preservação moderada do conhecimento anterior")
+        else:
+            logger.info("   ❌ Catastrophic forgetting significativo detectado")
+        
+        if adaptation_score > 0.85:
+            logger.info("   ✅ Excelente adaptação aos novos dados!")
+        elif adaptation_score > 0.70:
+            logger.info("   ⚠️ Adaptação moderada aos novos dados")
+        else:
+            logger.info("   ❌ Dificuldade em aprender novos padrões")
+    
+    # Salvar relatório final
+    final_report = {
+        'training_completed': True,
+        'total_epochs': epoch + 1,
         'best_accuracy': best_accuracy,
-        'config': {
-            'base_model': BASE_MODEL_PATH,
-            'dataset': CAPTCHA_FOLDER,
-            'batch_size': BATCH_SIZE,
-            'learning_rate': LEARNING_RATE,
-            'epochs_trained': len(train_losses),
-            'augmentation_prob': AUGMENT_PROB
-        }
+        'best_old_accuracy': best_old_accuracy,
+        'best_new_accuracy': best_new_accuracy,
+        'final_train_loss': train_losses[-1] if train_losses else None,
+        'final_val_loss': val_losses[-1] if val_losses else None,
+        'training_time': sum([epoch_time for epoch_time in range(epoch + 1)]),
+        'model_path': os.path.join(OUTPUT_DIR, 'best_model')
     }
     
-    with open(os.path.join(OUTPUT_DIR, "training_history.json"), 'w') as f:
-        json.dump(history, f, indent=2)
+    with open(os.path.join(OUTPUT_DIR, "training_report.json"), 'w') as f:
+        json.dump(final_report, f, indent=2)
     
-    logger.info(f"📊 Histórico salvo em: {os.path.join(OUTPUT_DIR, 'training_history.json')}")
-    
-    # Análise de overfitting
-    if len(train_losses) > 0 and len(val_losses) > 0:
-        final_gap = val_losses[-1] - train_losses[-1]
-        logger.info(f"\n📈 Análise de Overfitting:")
-        logger.info(f"   Gap final (Val-Train): {final_gap:.4f}")
-        
-        if final_gap < 0.3:
-            logger.info("   ✅ Excelente! Overfitting mínimo")
-        elif final_gap < 0.6:
-            logger.info("   ✅ Bom! Overfitting controlado")
-        elif final_gap < 1.0:
-            logger.info("   ⚠️ Atenção! Overfitting moderado")
-        else:
-            logger.info("   ❌ Overfitting significativo detectado")
+    logger.info(f"\n📄 Relatório final salvo em: {os.path.join(OUTPUT_DIR, 'training_report.json')}")
 
 if __name__ == "__main__":
     try:
-        # Instalar dependências se necessário
-        try:
-            import cv2
-        except ImportError:
-            logger.info("Instalando opencv-python...")
-            os.system("pip install opencv-python")
-            import cv2
-        
-        retrain_complex_captcha()
+        incremental_training()
     except KeyboardInterrupt:
-        logger.info("\n⏹️ Treinamento interrompido pelo usuário")
+        logger.info("\n⛔ Treinamento interrompido pelo usuário")
     except Exception as e:
-        logger.error(f"❌ Erro: {e}")
+        logger.error(f"❌ Erro fatal: {e}")
         import traceback
         traceback.print_exc()
