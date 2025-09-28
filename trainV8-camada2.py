@@ -510,26 +510,26 @@ def incremental_training():
     setup_torch_serialization()
     
     # ====== CONFIGURAÇÕES OTIMIZADAS PARA MÁXIMO APRENDIZADO ======
-    BASE_MODEL_PATH = "./trocr-incremental-9/best_model"   # Modelo base treinado
+    BASE_MODEL_PATH = "./trocr-incremental-17/best_model"   # Modelo base treinado
     OLD_DATASET_PATH = "./img_base_captcha"                    # Dataset original (para replay)
-    NEW_DATASET_PATH = "./captcha-full"                # Novo dataset complexo
-    OUTPUT_DIR = "./trocr-incremental-12"                  # Diretório de saída
+    NEW_DATASET_PATH = "./captchasv1"                # Novo dataset complexo
+    OUTPUT_DIR = "./trocr-incremental-18"                  # Diretório de saída
     
     # Hiperparâmetros otimizados
     BATCH_SIZE = 4                          # Aumentado de 1 para 4
-    GRADIENT_ACCUMULATION = 16              # Reduzido de 64 para 16
+    GRADIENT_ACCUMULATION = 8            # normal 16
     LEARNING_RATE = 2.5e-4                  # Aumentado para aprendizado mais agressivo
     MIN_LR = 5e-7
     WEIGHT_DECAY = 0.005                    # Reduzido para permitir mais adaptação
     
-    NUM_EPOCHS = 100                        # Aumentado para garantir convergência
+    NUM_EPOCHS = 50                        # Aumentado para garantir convergência
     PATIENCE = 20                           # Aumentado para dar mais chance
     WARMUP_STEPS = 500                      # Warmup em steps ao invés de ratio
     
     # Parâmetros de preservação de conhecimento otimizados
     USE_EWC = True                          # Elastic Weight Consolidation
     EWC_LAMBDA = 0.4                        # Reduzido para ser menos conservador
-    FISHER_SAMPLES = 1000                   # Aumentado para melhor estimativa
+    FISHER_SAMPLES = 10000                  # Aumentado para melhor estimativa
     
     USE_DISTILLATION = True                 # Knowledge Distillation
     DISTILLATION_ALPHA = 0.5               # 45% preservação, 55% novo
@@ -548,19 +548,19 @@ def incremental_training():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     logger.info("="*70)
-    logger.info("🚀 TREINAMENTO INCREMENTAL OTIMIZADO - MÁXIMO APRENDIZADO")
+    logger.info(" TREINAMENTO INCREMENTAL OTIMIZADO - MÁXIMO APRENDIZADO")
     logger.info("="*70)
-    logger.info(f"📍 Device: {device}")
-    logger.info(f"📁 Modelo base: {BASE_MODEL_PATH}")
-    logger.info(f"📁 Dataset antigo: {OLD_DATASET_PATH}")
-    logger.info(f"📁 Dataset novo: {NEW_DATASET_PATH}")
-    logger.info(f"📁 Output: {OUTPUT_DIR}")
-    logger.info(f"⚙️  Effective Batch Size: {BATCH_SIZE * GRADIENT_ACCUMULATION}")
-    logger.info(f"📈 Learning rate: {LEARNING_RATE}")
-    logger.info(f"🔧 EWC: {USE_EWC} (λ={EWC_LAMBDA}, samples={FISHER_SAMPLES})")
-    logger.info(f"🔧 Distillation: {USE_DISTILLATION} (α={DISTILLATION_ALPHA}, T={DISTILLATION_TEMPERATURE})")
-    logger.info(f"🔧 Replay: {USE_REPLAY} (ratio={REPLAY_RATIO}, buffer={REPLAY_BUFFER_SIZE})")
-    logger.info(f"🔧 Mixup: {USE_MIXUP} (α={MIXUP_ALPHA})")
+    logger.info(f" Device: {device}")
+    logger.info(f" Modelo base: {BASE_MODEL_PATH}")
+    logger.info(f" Dataset antigo: {OLD_DATASET_PATH}")
+    logger.info(f" Dataset novo: {NEW_DATASET_PATH}")
+    logger.info(f" Output: {OUTPUT_DIR}")
+    logger.info(f"  Effective Batch Size: {BATCH_SIZE * GRADIENT_ACCUMULATION}")
+    logger.info(f" Learning rate: {LEARNING_RATE}")
+    logger.info(f" EWC: {USE_EWC} (λ={EWC_LAMBDA}, samples={FISHER_SAMPLES})")
+    logger.info(f" Distillation: {USE_DISTILLATION} (α={DISTILLATION_ALPHA}, T={DISTILLATION_TEMPERATURE})")
+    logger.info(f" Replay: {USE_REPLAY} (ratio={REPLAY_RATIO}, buffer={REPLAY_BUFFER_SIZE})")
+    logger.info(f" Mixup: {USE_MIXUP} (α={MIXUP_ALPHA})")
     
     # Criar diretórios
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -568,7 +568,7 @@ def incremental_training():
     
     # ====== CARREGAR MODELO BASE E CRIAR CÓPIA PARA TEACHER ======
     logger.info("\n" + "="*70)
-    logger.info("📚 CARREGANDO MODELOS")
+    logger.info(" CARREGANDO MODELOS")
     logger.info("="*70)
     
     try:
@@ -588,7 +588,7 @@ def incremental_training():
             teacher_model = None
             
     except Exception as e:
-        logger.error(f"❌ Erro ao carregar modelo base: {e}")
+        logger.error(f" Erro ao carregar modelo base: {e}")
         return
     
     # Configurar student model
@@ -597,7 +597,7 @@ def incremental_training():
     
     # ====== CARREGAR DATASETS ======
     logger.info("\n" + "="*70)
-    logger.info("📊 CARREGANDO DATASETS")
+    logger.info(" CARREGANDO DATASETS")
     logger.info("="*70)
     
     # Carregar dataset antigo para replay
@@ -613,7 +613,7 @@ def incremental_training():
                     old_image_paths.append(image_path)
                     old_labels.append(label)
         
-        logger.info(f"📂 Dataset antigo: {len(old_image_paths)} imagens")
+        logger.info(f" Dataset antigo: {len(old_image_paths)} imagens")
     
     # Carregar novo dataset
     new_image_paths = []
@@ -627,7 +627,7 @@ def incremental_training():
                 new_image_paths.append(image_path)
                 new_labels.append(label)
     
-    logger.info(f"📂 Dataset novo: {len(new_image_paths)} imagens")
+    logger.info(f" Dataset novo: {len(new_image_paths)} imagens")
     
     # Criar replay buffer
     replay_buffer = ReplayBuffer(REPLAY_BUFFER_SIZE)
@@ -645,7 +645,7 @@ def incremental_training():
             priority = random.uniform(0.8, 1.2)
             replay_buffer.add(old_image_paths[idx], old_labels[idx], priority)
         
-        logger.info(f"💾 Replay buffer: {len(replay_buffer.buffer)} exemplos antigos")
+        logger.info(f" Replay buffer: {len(replay_buffer.buffer)} exemplos antigos")
     
     # Combinar datasets e rastrear origem
     if USE_REPLAY and len(replay_buffer.buffer) > 0:
@@ -657,7 +657,7 @@ def incremental_training():
         # Rastrear origem dos dados
         is_old_data = [False] * len(new_image_paths) + [True] * len(replay_paths)
         
-        logger.info(f"📊 Dataset combinado: {len(combined_paths)} imagens total")
+        logger.info(f" Dataset combinado: {len(combined_paths)} imagens total")
         logger.info(f"   → {len(new_image_paths)} novas ({(len(new_image_paths)/len(combined_paths)*100):.1f}%)")
         logger.info(f"   → {len(replay_paths)} antigas ({(len(replay_paths)/len(combined_paths)*100):.1f}%)")
     else:
@@ -684,14 +684,14 @@ def incremental_training():
         random_state=42
     )
     
-    logger.info(f"\n📊 Split final:")
+    logger.info(f"\n Split final:")
     logger.info(f"   → Treino: {len(train_paths)} imagens (85%)")
     logger.info(f"   → Validação: {len(val_paths)} imagens (15%)")
     
     # ====== CALCULAR EWC SE NECESSÁRIO ======
     ewc = None
     if USE_EWC and len(old_image_paths) > 0:
-        logger.info("\n⚖️ Calculando Fisher Information Matrix para EWC...")
+        logger.info("\n ->Calculando Fisher Information Matrix para EWC...")
         
         # Usar mais amostras para melhor estimativa
         n_fisher_samples = min(FISHER_SAMPLES, len(old_image_paths))
@@ -800,7 +800,7 @@ def incremental_training():
     
     # ====== TREINAMENTO ======
     logger.info("\n" + "="*70)
-    logger.info("🎯 INICIANDO TREINAMENTO INCREMENTAL OTIMIZADO")
+    logger.info(" INICIANDO TREINAMENTO INCREMENTAL OTIMIZADO")
     logger.info("="*70)
     
     best_accuracy = 0
@@ -955,20 +955,20 @@ def incremental_training():
         
         # ====== LOG METRICS ======
         logger.info(f"\n{'='*70}")
-        logger.info(f"📊 Epoch {epoch+1}/{NUM_EPOCHS} ({epoch_time:.1f}s)")
-        logger.info(f"📉 Loss - Train: {avg_train_loss:.4f}, Val: {avg_val_loss:.4f}")
-        logger.info(f"🎯 Accuracy Total: {accuracy:.2%}")
+        logger.info(f" Epoch {epoch+1}/{NUM_EPOCHS} ({epoch_time:.1f}s)")
+        logger.info(f" Loss - Train: {avg_train_loss:.4f}, Val: {avg_val_loss:.4f}")
+        logger.info(f" Accuracy Total: {accuracy:.2%}")
         logger.info(f"   └─ Dados Antigos: {old_accuracy:.2%}")
         logger.info(f"   └─ Dados Novos: {new_accuracy:.2%}")
-        logger.info(f"📈 Learning Rate: {scheduler.get_last_lr()[0]:.2e}")
+        logger.info(f" Learning Rate: {scheduler.get_last_lr()[0]:.2e}")
         
         if USE_EWC and ewc_loss_total > 0:
-            logger.info(f"⚖️ EWC Penalty médio: {ewc_loss_total/len(train_loader):.4f}")
+            logger.info(f" EWC Penalty médio: {ewc_loss_total/len(train_loader):.4f}")
         if USE_DISTILLATION and kd_loss_total > 0:
-            logger.info(f"🔄 KD Loss médio: {kd_loss_total/len(train_loader):.4f}")
+            logger.info(f" KD Loss médio: {kd_loss_total/len(train_loader):.4f}")
         if grad_norms:
             grad_norms_values = [g.item() if isinstance(g, torch.Tensor) else g for g in grad_norms]
-            logger.info(f"📊 Gradient Norm médio: {np.mean(grad_norms_values):.2f}")
+            logger.info(f" Gradient Norm médio: {np.mean(grad_norms_values):.2f}")
         
         # ====== SALVAR CHECKPOINT ======
         if accuracy > best_accuracy:
@@ -1015,11 +1015,11 @@ def incremental_training():
             with open(os.path.join(best_model_path, "metrics.json"), 'w') as f:
                 json.dump(metrics_dict, f, indent=2)
             
-            logger.info(f"🏆 Novo melhor modelo salvo: {best_accuracy:.2%}")
+            logger.info(f"-----> Novo melhor modelo salvo: {best_accuracy:.2%}")
         else:
             patience_counter += 1
             if patience_counter >= PATIENCE:
-                logger.info(f"\n⛔ Early stopping após {PATIENCE} epochs sem melhoria")
+                logger.info(f"\n Early stopping após {PATIENCE} epochs sem melhoria")
                 break
         
         # Salvar checkpoint periódico
@@ -1035,20 +1035,20 @@ def incremental_training():
                 'val_losses': val_losses,
                 'accuracies': accuracies
             }, checkpoint_path)
-            logger.info(f"💾 Checkpoint salvo: {checkpoint_path}")
+            logger.info(f" Checkpoint salvo: {checkpoint_path}")
     
     # ====== ANÁLISE FINAL ======
     logger.info("\n" + "="*70)
-    logger.info("🎉 TREINAMENTO INCREMENTAL COMPLETO!")
+    logger.info(" TREINAMENTO INCREMENTAL COMPLETO!")
     logger.info("="*70)
-    logger.info(f"🏆 Melhor acurácia total: {best_accuracy:.2%}")
+    logger.info(f" Melhor acurácia total: {best_accuracy:.2%}")
     logger.info(f"   └─ Em dados antigos: {best_old_accuracy:.2%}")
     logger.info(f"   └─ Em dados novos: {best_new_accuracy:.2%}")
-    logger.info(f"📁 Modelo salvo em: {os.path.join(OUTPUT_DIR, 'best_model')}")
+    logger.info(f" Modelo salvo em: {os.path.join(OUTPUT_DIR, 'best_model')}")
     
     # Análise de catastrophic forgetting
     if best_old_accuracy > 0 and best_new_accuracy > 0:
-        logger.info(f"\n📊 Análise de Preservação de Conhecimento:")
+        logger.info(f"\n Análise de Preservação de Conhecimento:")
         
         preservation_score = best_old_accuracy
         adaptation_score = best_new_accuracy
@@ -1059,18 +1059,18 @@ def incremental_training():
         logger.info(f"   Score geral: {overall_score:.2%}")
         
         if preservation_score > 0.75:
-            logger.info("   ✅ Excelente preservação do conhecimento anterior!")
+            logger.info("    Excelente preservação do conhecimento anterior!")
         elif preservation_score > 0.60:
-            logger.info("   ⚠️ Preservação moderada do conhecimento anterior")
+            logger.info("    Preservação moderada do conhecimento anterior")
         else:
-            logger.info("   ❌ Catastrophic forgetting significativo detectado")
+            logger.info("    Catastrophic forgetting significativo detectado")
         
         if adaptation_score > 0.85:
-            logger.info("   ✅ Excelente adaptação aos novos dados!")
+            logger.info("    Excelente adaptação aos novos dados!")
         elif adaptation_score > 0.70:
-            logger.info("   ⚠️ Adaptação moderada aos novos dados")
+            logger.info("    Adaptação moderada aos novos dados")
         else:
-            logger.info("   ❌ Dificuldade em aprender novos padrões")
+            logger.info("    Dificuldade em aprender novos padrões")
     
     # Salvar relatório final
     final_report = {
@@ -1088,14 +1088,14 @@ def incremental_training():
     with open(os.path.join(OUTPUT_DIR, "training_report.json"), 'w') as f:
         json.dump(final_report, f, indent=2)
     
-    logger.info(f"\n📄 Relatório final salvo em: {os.path.join(OUTPUT_DIR, 'training_report.json')}")
+    logger.info(f"\n Relatório final salvo em: {os.path.join(OUTPUT_DIR, 'training_report.json')}")
 
 if __name__ == "__main__":
     try:
         incremental_training()
     except KeyboardInterrupt:
-        logger.info("\n⛔ Treinamento interrompido pelo usuário")
+        logger.info("\n Treinamento interrompido pelo usuário")
     except Exception as e:
-        logger.error(f"❌ Erro fatal: {e}")
+        logger.error(f" Erro fatal: {e}")
         import traceback
         traceback.print_exc()
